@@ -1,3 +1,5 @@
 /detour
 /detour.json
 .DS_Store
+detour.log
+.detour.pid

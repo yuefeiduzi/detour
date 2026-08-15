@@ -16,19 +16,52 @@ opencode ──http://127.0.0.1:8787──▶ detour ──梯子(127.0.0.1:7897
 
 ```bash
 go build -o detour .        # 在能上网的机器上构建（或直接下载二进制）
-./detour                    # 默认配置开箱即用（见下）
+./detour.sh start           # 一键启动（默认对接 opencode go，见下）
 ```
 
-默认配置已经匹配 Clash Verge 的混合端口：
+`detour.sh` 是管理脚本：`start` / `stop` / `restart` / `status` / `check` / `log` / `build`。
+
+## opencode go（默认场景）
+
+脚本默认把请求转发到 opencode 自家的 **OpenCode Go** 服务
+（`https://opencode.ai/zen/go/v1/`，OpenAI 兼容，走 `/responses` 和 `/chat/completions`）：
+
+```
+opencode ──http://127.0.0.1:8787──▶ detour ──梯子(127.0.0.1:7897)──▶ opencode.ai/zen/go/v1
+```
+
+```bash
+./detour.sh start
+```
+
+然后在 `~/.config/opencode/opencode.json` 里把 `opencode-go` 的 baseURL 指向本地：
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "opencode-go": {
+      "options": {
+        "baseURL": "http://127.0.0.1:8787"
+      }
+    }
+  }
+}
+```
+
+如果之前用 `/connect` 登录过 opencode go，key 仍然生效；否则在 `options` 里加
+`"apiKey": "你的 OPENCODE_API_KEY"`。
+
+默认配置（可用环境变量覆盖，见 `detour.sh` 开头）：
 
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
 | `-listen` | `127.0.0.1:8787` | 本地监听地址 |
-| `-upstream` | `https://api.openai.com/v1` | 真实 API 地址（供应商 base URL） |
+| `-upstream` | `https://opencode.ai/zen/go/v1/` | 真实 API 地址（供应商 base URL） |
 | `-proxy` | `http://127.0.0.1:7897` | 梯子代理地址，支持 `http://` 和 `socks5://`，`direct` 表示直连 |
 
 其他梯子（V2Ray / sing-box / Surge 等）把端口改成自己的就行：
-`./detour -proxy socks5://127.0.0.1:1080`。
+`./detour.sh start` 前先 `export DETOUR_PROXY=socks5://127.0.0.1:1080`。
 
 ## 配置 opencode
 
