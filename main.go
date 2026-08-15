@@ -20,18 +20,18 @@ import (
 	"time"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 const (
 	defaultListen   = "127.0.0.1:8787"
-	defaultUpstream = "https://api.anthropic.com/v1"
+	defaultUpstream = "https://api.openai.com/v1"
 	defaultProxy    = "http://127.0.0.1:7897"
 )
 
 // Config is the effective configuration; JSON field names match the config file.
 type Config struct {
 	Listen   string `json:"listen"`   // e.g. 127.0.0.1:8787
-	Upstream string `json:"upstream"` // real API base URL, e.g. https://api.anthropic.com/v1
+	Upstream string `json:"upstream"` // real API base URL, e.g. https://api.openai.com/v1
 	Proxy    string `json:"proxy"`    // http://..., socks5://..., or "" / "direct"
 	Verbose  bool   `json:"verbose"`  // log request headers
 	TLSCert  string `json:"tls_cert"` // serve HTTPS with this PEM cert (optional)
@@ -70,7 +70,7 @@ func loadConfig(path string) (*Config, error) {
 func parseFlags(cfg *Config) {
 	configPath := flag.String("config", "", "path to a JSON config file (optional)")
 	listen := flag.String("listen", "", "listen address, e.g. 127.0.0.1:8787 (overrides config file)")
-	upstream := flag.String("upstream", "", "real API base URL, e.g. https://api.anthropic.com/v1 (overrides config file)")
+	upstream := flag.String("upstream", "", "real API base URL, e.g. https://api.openai.com/v1 (overrides config file)")
 	proxy := flag.String("proxy", "", "proxy URL: http://127.0.0.1:7897 or socks5://127.0.0.1:7891; \"direct\" for no proxy (overrides config file)")
 	verbose := flag.Bool("v", false, "verbose: log request headers")
 	check := flag.Bool("check", false, "probe connectivity through the proxy, then exit")
@@ -86,7 +86,7 @@ http://127.0.0.1:8787) to the real API through a local proxy, so only the
 API traffic is proxied instead of running the proxy globally.
 
 Examples:
-  detour                                        # defaults: :8787 -> api.anthropic.com/v1 via 127.0.0.1:7897
+  detour                                        # defaults: :8787 -> api.openai.com/v1 via 127.0.0.1:7897
   detour -upstream https://api.deepseek.com/v1  # different provider
   detour -proxy socks5://127.0.0.1:7891         # SOCKS5 proxy
   detour -proxy direct                          # no proxy (testing only)

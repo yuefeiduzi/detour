@@ -1,6 +1,6 @@
 {
   "listen": "127.0.0.1:8787",
-  "upstream": "https://api.anthropic.com/v1",
+  "upstream": "https://api.openai.com/v1",
   "proxy": "http://127.0.0.1:7897",
   "verbose": false
 }

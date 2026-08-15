@@ -5,8 +5,11 @@ detour 是一个跑在本地的小型转发服务：把 opencode 的模型地址
 detour 收到请求后通过本地梯子转发到真实 API。梯子保持规则模式即可，
 只有模型 API 的流量走代理。
 
+支持 OpenAI **Responses API**（`/v1/responses`）和 **Chat Completions API**
+（`/v1/chat/completions`，以及所有 OpenAI 兼容服务）。
+
 ```
-opencode ──http://127.0.0.1:8787──▶ detour ──梯子(127.0.0.1:7897)──▶ api.anthropic.com
+opencode ──http://127.0.0.1:8787──▶ detour ──梯子(127.0.0.1:7897)──▶ api.openai.com
 ```
 
 ## 快速开始
@@ -21,7 +24,7 @@ go build -o detour .        # 在能上网的机器上构建（或直接下载�
 | 配置项 | 默认值 | 说明 |
 |---|---|---|
 | `-listen` | `127.0.0.1:8787` | 本地监听地址 |
-| `-upstream` | `https://api.anthropic.com/v1` | 真实 API 地址（供应商 base URL） |
+| `-upstream` | `https://api.openai.com/v1` | 真实 API 地址（供应商 base URL） |
 | `-proxy` | `http://127.0.0.1:7897` | 梯子代理地址，支持 `http://` 和 `socks5://`，`direct` 表示直连 |
 
 其他梯子（V2Ray / sing-box / Surge 等）把端口改成自己的就行：
@@ -30,13 +33,15 @@ go build -o detour .        # 在能上网的机器上构建（或直接下载�
 ## 配置 opencode
 
 编辑 `~/.config/opencode/opencode.json`（或项目里的 `opencode.json`），
-把模型供应商的 `baseURL` 指向本地：
+把模型供应商的 `baseURL` 指向本地。
+
+**OpenAI（Responses API）：**
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "anthropic": {
+    "openai": {
       "options": {
         "baseURL": "http://127.0.0.1:8787"
       }
@@ -45,17 +50,34 @@ go build -o detour .        # 在能上网的机器上构建（或直接下载�
 }
 ```
 
-其他供应商同理，只要把 `-upstream` 换成供应商的真实地址：
+**其他 OpenAI 兼容服务（Chat Completions API），以 DeepSeek 为例：**
 
-| 供应商 | `-upstream` |
-|---|---|
-| Anthropic | `https://api.anthropic.com/v1` |
-| OpenAI | `https://api.openai.com/v1` |
-| DeepSeek | `https://api.deepseek.com/v1` |
-| 其他 OpenAI 兼容 | 供应商文档里的 base URL |
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "deepseek": {
+      "options": {
+        "baseURL": "http://127.0.0.1:8787"
+      }
+    }
+  }
+}
+```
 
-路径会自动拼接：opencode 发 `POST /messages`，detour 转发为
-`POST https://api.anthropic.com/v1/messages`。就算你在 opencode 里把
+对应的 `-upstream` 设为该供应商的真实地址：
+
+| 供应商 | API | `-upstream` |
+|---|---|---|
+| OpenAI | Responses / Chat | `https://api.openai.com/v1` |
+| DeepSeek | Chat | `https://api.deepseek.com/v1` |
+| Kimi / Moonshot | Chat | `https://api.moonshot.cn/v1` |
+| 智谱 GLM | Chat | `https://open.bigmodel.cn/api/paas/v4` |
+| 其他 OpenAI 兼容 | Chat | 供应商文档里的 base URL |
+
+路径会自动拼接：opencode 发 `POST /responses` 或 `POST /chat/completions`，
+detour 转发为 `https://api.openai.com/v1/responses` 或
+`https://api.openai.com/v1/chat/completions`。就算在 opencode 里把
 baseURL 配成了 `http://127.0.0.1:8787/v1`（带路径）也不会拼重。
 
 ## 配置文件
@@ -65,7 +87,7 @@ baseURL 配成了 `http://127.0.0.1:8787/v1`（带路径）也不会拼重。
 ```json
 {
   "listen": "127.0.0.1:8787",
-  "upstream": "https://api.anthropic.com/v1",
+  "upstream": "https://api.openai.com/v1",
   "proxy": "http://127.0.0.1:7897",
   "verbose": false
 }
@@ -90,9 +112,8 @@ baseURL 配成了 `http://127.0.0.1:8787/v1`（带路径）也不会拼重。
   规则模式下确认模型 API 域名走代理节点（Clash Verge 的"规则"页面可以看到）。
 - **请求返回 502**：detour 连不上上游，看日志里的 `upstream error` 一行。
 - **opencode 报 models.dev 相关错误**：opencode 会从 models.dev 拉模型元数据，
-  如果它也被墙，在 opencode 配置里加 `"models.dev": true` 之外，可考虑
-  给 models.dev 单独配代理规则。
-- **梯子规则模式**：确保 `api.anthropic.com` 等域名命中代理规则；或者
+  如果它也被墙，给 models.dev 单独配代理规则即可。
+- **梯子规则模式**：确保 `api.openai.com` 等域名命中代理规则；或者
   在 Clash 里把这些域名加进代理组。detour 的意义就是让你不用开全局。
 
 ## 安全
@@ -105,5 +126,5 @@ baseURL 配成了 `http://127.0.0.1:8787/v1`（带路径）也不会拼重。
 - 用 Go 标准库实现，零依赖，单个静态二进制，拷到公司电脑直接跑（不用装 Go）。
 - HTTP 代理走标准 CONNECT 隧道；SOCKS5 是内置的最小实现，
   域名始终交给代理解析（ATYP=3），避免本地 DNS 污染。
-- SSE 流式响应（`text/event-stream`）逐块透传，不缓冲，首 token 延迟和直连一致。
-- 请求日志：`POST /v1/messages -> https://api.anthropic.com/v1/messages | 401 | 730ms | 106 B`
+- SSE 流式响应逐块透传，不缓冲，首 token 延迟和直连一致。
+- 请求日志：`POST /v1/responses -> https://api.openai.com/v1/responses | 200 | 3.42s | 1.1 MB`

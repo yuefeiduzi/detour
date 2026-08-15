@@ -254,9 +254,9 @@ func TestHTTPProxyMode(t *testing.T) {
 	rec := &recorder{}
 	upstream := startTLSUpstream(t, http.HandlerFunc(rec.record))
 	proxy := startFakeProxy(t)
-	relay := startRelay(t, Config{Upstream: upstream.URL, Proxy: proxy})
+	relay := startRelay(t, Config{Upstream: upstream.URL + "/v1", Proxy: proxy})
 
-	req, _ := http.NewRequest(http.MethodPost, relay+"/v1/messages", strings.NewReader(`{"model":"x"}`))
+	req, _ := http.NewRequest(http.MethodPost, relay+"/responses", strings.NewReader(`{"model":"gpt-5"}`))
 	req.Header.Set("Authorization", "Bearer sk-test")
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
@@ -274,8 +274,8 @@ func TestHTTPProxyMode(t *testing.T) {
 	}
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	if rec.lastPath != "/v1/messages" {
-		t.Errorf("upstream path = %q, want /v1/messages", rec.lastPath)
+	if rec.lastPath != "/v1/responses" {
+		t.Errorf("upstream path = %q, want /v1/responses", rec.lastPath)
 	}
 	if rec.lastHost != upstream.Listener.Addr().String() {
 		t.Errorf("upstream Host = %q, want %q", rec.lastHost, upstream.Listener.Addr().String())
@@ -291,10 +291,10 @@ func TestSOCKS5Mode(t *testing.T) {
 	socks := startFakeSOCKS5(t)
 	// use a hostname to exercise the SOCKS5 domain (ATYP=3) path
 	_, port, _ := net.SplitHostPort(upstream.Listener.Addr().String())
-	upstreamURL := "https://localhost:" + port
+	upstreamURL := "https://localhost:" + port + "/v1"
 	relay := startRelay(t, Config{Upstream: upstreamURL, Proxy: "socks5://" + socks})
 
-	resp := doGet(t, relay+"/v1/messages")
+	resp := doGet(t, relay+"/chat/completions")
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || string(body) != `{"ok":true}` {
@@ -302,8 +302,8 @@ func TestSOCKS5Mode(t *testing.T) {
 	}
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	if rec.lastPath != "/v1/messages" {
-		t.Errorf("upstream path = %q, want /v1/messages", rec.lastPath)
+	if rec.lastPath != "/v1/chat/completions" {
+		t.Errorf("upstream path = %q, want /v1/chat/completions", rec.lastPath)
 	}
 	if rec.lastHost != "localhost:"+port {
 		t.Errorf("upstream Host = %q, want localhost:%s", rec.lastHost, port)
@@ -316,7 +316,7 @@ func TestDirectMode(t *testing.T) {
 	t.Cleanup(upstream.Close)
 	relay := startRelay(t, Config{Upstream: upstream.URL, Proxy: "direct"})
 
-	resp := doGet(t, relay+"/v1/messages")
+	resp := doGet(t, relay+"/responses")
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK || string(body) != `{"ok":true}` {
@@ -372,7 +372,7 @@ func TestStreaming(t *testing.T) {
 	relay := startRelay(t, Config{Upstream: upstream.URL, Proxy: proxy})
 
 	start := time.Now()
-	resp := doGet(t, relay+"/v1/messages")
+	resp := doGet(t, relay+"/responses")
 	defer resp.Body.Close()
 	if ct := resp.Header.Get("Content-Type"); ct != "text/event-stream" {
 		t.Fatalf("Content-Type = %q", ct)
