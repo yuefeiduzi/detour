@@ -357,6 +357,37 @@ func TestPathPrefix(t *testing.T) {
 	}
 }
 
+// TestPathPrefixV1Joining verifies the smart /v1 join: a client whose API
+// shape appends /v1/messages (Anthropic SDK) must not produce a doubled /v1
+// when the upstream prefix itself ends in /v1 (e.g. opencode.go's /zen/go/v1).
+func TestPathPrefixV1Joining(t *testing.T) {
+	rec := &recorder{}
+	upstream := httptest.NewServer(http.HandlerFunc(rec.record))
+	t.Cleanup(upstream.Close)
+	proxy := startFakeProxy(t)
+	relay := startRelay(t, Config{Upstream: upstream.URL + "/zen/go/v1", Proxy: proxy})
+
+	cases := []struct{ in, want string }{
+		{"/v1/messages", "/zen/go/v1/messages"},              // anthropic-messages shape
+		{"/responses", "/zen/go/v1/responses"},               // openai responses shape
+		{"/chat/completions", "/zen/go/v1/chat/completions"}, // openai completions shape
+		{"/zen/go/v1/models", "/zen/go/v1/models"},           // already prefixed -> unchanged
+	}
+	for _, tc := range cases {
+		rec.paths = nil
+		resp := doGet(t, relay+tc.in)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: status = %d", tc.in, resp.StatusCode)
+		}
+		rec.mu.Lock()
+		if len(rec.paths) != 1 || rec.paths[0] != tc.want {
+			t.Errorf("%s: upstream path = %v, want %q", tc.in, rec.paths, tc.want)
+		}
+		rec.mu.Unlock()
+	}
+}
+
 func TestStreaming(t *testing.T) {
 	upstream := startTLSUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

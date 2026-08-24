@@ -1,0 +1,11 @@
+{
+  "name": "detour",
+  "version": "0.3.0",
+  "private": true,
+  "description": "Local relay + pi plugin: route pi's OpenCode Go traffic through a local proxy (company-network friendly)",
+  "keywords": ["pi-package", "pi", "opencode-go", "proxy", "relay", "detour"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./pi-extension/index.ts"]
+  }
+}

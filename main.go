@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 const (
 	defaultListen   = "127.0.0.1:8787"
@@ -174,6 +174,28 @@ func buildTransport(cfg *Config) (*http.Transport, error) {
 	}
 }
 
+// joinUpstreamPath joins the upstream path prefix onto an incoming request
+// path, without doubling a shared trailing /v1 segment:
+//
+//	prefix "/zen/go/v1" + incoming "/responses"    -> "/zen/go/v1/responses"
+//	prefix "/zen/go/v1" + incoming "/v1/messages" -> "/zen/go/v1/messages"
+//	prefix "/zen/go/v1" + incoming "/zen/go/v1/..." -> unchanged
+//
+// The middle case matters for clients (e.g. pi, the Anthropic SDK) whose API
+// shape always appends /v1/messages on top of the configured base URL.
+func joinUpstreamPath(prefix, path string) string {
+	if prefix == "" {
+		return path
+	}
+	if strings.HasPrefix(path, prefix) {
+		return path // client already sent the full upstream path
+	}
+	if strings.HasSuffix(prefix, "/v1") && strings.HasPrefix(path, "/v1") {
+		return prefix + strings.TrimPrefix(path, "/v1")
+	}
+	return prefix + path
+}
+
 // newRelay builds the reverse-proxy handler that forwards local requests to
 // the upstream API. If the upstream URL has a path prefix (e.g. /v1) and the
 // incoming path does not already start with it, the prefix is prepended, so
@@ -195,10 +217,8 @@ func newRelay(cfg *Config, tr *http.Transport) (http.Handler, error) {
 		Transport: tr,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			r := pr.Out
-			if prefix != "" && !strings.HasPrefix(r.URL.Path, prefix) {
-				r.URL.Path = prefix + r.URL.Path
-				r.URL.RawPath = ""
-			}
+			r.URL.Path = joinUpstreamPath(prefix, r.URL.Path)
+			r.URL.RawPath = ""
 			r.URL.Scheme = upstream.Scheme
 			r.URL.Host = upstream.Host
 			r.Host = upstream.Host
@@ -235,9 +255,7 @@ func logMiddleware(next http.Handler, upstream *url.URL, prefix string, verbose 
 		fwd := *r.URL
 		fwd.Scheme = upstream.Scheme
 		fwd.Host = upstream.Host
-		if prefix != "" && !strings.HasPrefix(fwd.Path, prefix) {
-			fwd.Path = prefix + fwd.Path
-		}
+		fwd.Path = joinUpstreamPath(prefix, fwd.Path)
 		status := lw.status
 		if status == 0 {
 			status = http.StatusOK

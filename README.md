@@ -7,6 +7,8 @@ detour 收到请求后通过本地梯子转发到真实 API。梯子保持规则
 
 支持 OpenAI **Responses API**（`/v1/responses`）和 **Chat Completions API**
 （`/v1/chat/completions`，以及所有 OpenAI 兼容服务）。
+v0.3.0 起同时支持 **Anthropic Messages API**（`/v1/messages`）——上游路径
+以 `/v1` 结尾而客户端请求又以 `/v1` 开头时不再重复拼接（见[工作原理](#工作原理)）。
 
 ```
 opencode ──http://127.0.0.1:8787──▶ detour ──梯子(127.0.0.1:7897)──▶ api.openai.com
@@ -62,6 +64,21 @@ opencode ──http://127.0.0.1:8787──▶ detour ──梯子(127.0.0.1:7897
 
 其他梯子（V2Ray / sing-box / Surge 等）把端口改成自己的就行：
 `./detour.sh start` 前先 `export DETOUR_PROXY=socks5://127.0.0.1:1080`。
+
+## 给 pi 用（pi 插件）
+
+[pi](https://pi.dev) 自带 opencode-go provider，公司网络直连不通时，用仓库里的
+`pi-extension/` 插件即可：插件把 opencode-go 所有模型的 baseUrl 自动指到本地
+detour，detour 没在跑时自动拉起，密钥用原来的 `OPENCODE_API_KEY`（或
+`/login opencode-go`）——**配好 key 就能用，不用配模型和参数**。
+
+```bash
+cp pi-extension/index.ts ~/.pi/agent/extensions/detour.ts   # 方式一：直接放扩展目录
+# 或方式二：pi install git:github.com/ross/detour
+```
+
+启动 pi 后 `/model` 选 opencode-go 模型即可；`/detour` 命令可管理/检查转发。
+详见 [pi-extension/README.md](pi-extension/README.md)。
 
 ## 配置 opencode
 
@@ -160,4 +177,7 @@ baseURL 配成了 `http://127.0.0.1:8787/v1`（带路径）也不会拼重。
 - HTTP 代理走标准 CONNECT 隧道；SOCKS5 是内置的最小实现，
   域名始终交给代理解析（ATYP=3），避免本地 DNS 污染。
 - SSE 流式响应逐块透传，不缓冲，首 token 延迟和直连一致。
+- 路径拼接（v0.3.0）：上游路径以 `/v1` 结尾且请求路径以 `/v1` 开头时不再重复
+  拼接（如 Anthropic SDK 的 `/v1/messages` 配上游 `.../zen/go/v1` 会正确转成
+  `.../zen/go/v1/messages` 而不是 `.../zen/go/v1/v1/messages`）。
 - 请求日志：`POST /v1/responses -> https://api.openai.com/v1/responses | 200 | 3.42s | 1.1 MB`
