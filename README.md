@@ -185,6 +185,14 @@ minimax-m3 等），直接开聊。
   - 能直连（家里/非公司网络）：**不走代理、不拉起 detour**，直接用原始地址；
   - 不能直连（公司网络）：自动改走本地 detour 并拉起 detour。
   - 可用 `DETOUR_MODE=always`（强制走代理）或 `DETOUR_MODE=never`（强制直连）覆盖。
+- **只改 opencode-go**：插件只覆盖 `opencode-go` 这一个 provider 的 baseUrl
+  （pi 的 registerProvider 按 provider 隔离），**`qwen-token-plan-cn`、`deepseek`
+  等 provider 保持原有地址直连，永远不经过 detour/梯子**；要额外转发必须显式写
+  `DETOUR_EXTRA_PROVIDERS`。
+- **全局代理是唯一例外**：如果进程里有 `HTTP_PROXY`/`HTTPS_PROXY`（或
+  `settings.json` 的 `httpProxy`），pi 会让**所有** provider 都走它（qwen 也一样）。
+  此时插件会把本地 detour 与 `DETOUR_DIRECT_HOSTS` 写进 `NO_PROXY` 保持直连，
+  并在会话启动时告警。用 `/detour env` 可查看。
 - **自动拉起 detour**：detour 没在跑时，自动用 `detour.sh start` 拉起来
   （监听、上游、代理参数跟随你的 detour 配置）。`PI_DETOUR_AUTO_START=0` 可关闭。
 
@@ -212,6 +220,7 @@ minimax-m3 等），直接开聊。
 | `DETOUR_PROXY` | `http://127.0.0.1:7897` | 梯子代理（改端口在这里） |
 | `DETOUR_BIN` | 自动查找 | detour 二进制路径（查找顺序：本变量 → 插件同级 ../detour → ~/self-git/detour/detour → PATH） |
 | `DETOUR_EXTRA_PROVIDERS` | 空 | 逗号分隔的额外 provider 名，同样指到本地 detour |
+| `DETOUR_DIRECT_HOSTS` | 空 | 逗号分隔域名。存在全局代理时写进 `NO_PROXY` 强制直连（如 qwen token-plan 的域名） |
 | `PI_DETOUR_AUTO_START` | 开 | 设 `0` 关闭自动拉起 detour |
 
 > 详细说明见 [pi-extension/README.md](pi-extension/README.md)。

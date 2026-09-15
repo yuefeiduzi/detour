@@ -10,6 +10,16 @@
  *   - 不能直连 → 覆盖到本地 detour，并自动拉起 detour
  * 用户也可以强制指定 DETOUR_MODE。
  *
+ * 作用范围：只改写 opencode-go（以及 DETOUR_EXTRA_PROVIDERS 显式列出的 provider）。
+ * 其它 provider（例如本机可直连的 qwen token-plan）保持 pi 原有 baseUrl，绝不经过
+ * detour/梯子。pi 的 registerProvider(name, { baseUrl }) 是按 provider 隔离的。
+ *
+ * 全局代理注意：pi 的 HTTP 层是全局 undici EnvHttpProxyAgent——只要进程里有
+ * HTTP_PROXY/HTTPS_PROXY（或 settings.json 的 httpProxy，pi 会把它写进这两个变量），
+ * 所有 provider 都会走那个代理，包括 qwen。插件会把本地 detour 地址和
+ * DETOUR_DIRECT_HOSTS 里的域名写进 NO_PROXY 让它们保持直连（undici 每次请求都会
+ * 重读 NO_PROXY，所以运行期设置同样生效）。
+ *
  * 零运行时依赖：只 import 类型 + Node 内置模块，可单文件复制到
  * ~/.pi/agent/extensions/ 使用，也可 pi install git:... 安装。
  *
@@ -22,6 +32,8 @@
  *   DETOUR_BIN           detour 二进制路径（默认自动查找：扩展同级的 ../detour、
  *                        ~/self-git/detour/detour、PATH）
  *   DETOUR_EXTRA_PROVIDERS 逗号分隔的额外 provider 名，同样改写 baseUrl 到本地
+ *   DETOUR_DIRECT_HOSTS  逗号分隔域名，存在全局代理时强制直连（写入 NO_PROXY），
+ *                        例如 token-plan.cn-beijing.maas.aliyuncs.com
  *   PI_DETOUR_AUTO_START 设为 0 关闭自动拉起 detour
  */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -41,6 +53,9 @@ const DEFAULT_UPSTREAM = "https://opencode.ai/zen/go/v1/";
 const DEFAULT_PROXY = "http://127.0.0.1:7897";
 const DIRECT_PROBE_TIMEOUT_MS = 7000; // 直连探测超时；公司网络典型表现为连接挂起
 
+/** 默认只改这一个 provider；其它 provider（qwen token-plan 等）永远保持原地址。 */
+const PRIMARY_PROVIDER = "opencode-go";
+
 type DetourMode = "auto" | "always" | "never";
 
 interface DetourConfig {
@@ -51,6 +66,7 @@ interface DetourConfig {
   mode: DetourMode;
   autoStart: boolean;
   extraProviders: string[];
+  directHosts: string[];     // 有全局代理时仍要直连的域名（写入 NO_PROXY）
   bin?: string;             // detour binary path found
   script?: string;          // detour.sh path found next to the binary
 }
@@ -58,6 +74,7 @@ interface DetourConfig {
 interface RuntimeState {
   directOk: boolean;        // true = 直连可达，直接走上游（不覆盖、不拉起 detour）
   mode: DetourMode;
+  noProxyAdded?: string;    // 本次写进 NO_PROXY 的直连域名，供 /detour 显示
 }
 
 const state: RuntimeState = { directOk: true, mode: "auto" };
@@ -91,6 +108,51 @@ function listenFromBaseUrl(baseUrl: string): string {
   return `${host}:${port}`;
 }
 
+/**
+ * pi 唯一的「全局代理」入口：HTTP(S)_PROXY（settings.json 的 httpProxy 也会被
+ * pi 复制到这两个变量）。一旦有值，pi 的全局 undici EnvHttpProxyAgent 会把所有
+ * provider 都代理掉——这是「所有请求都走代理」的唯一途径，插件本身不会设置它。
+ */
+function globalProxyEnv(): string | undefined {
+  const env = process.env;
+  return (env.HTTPS_PROXY ?? env.https_proxy ?? env.HTTP_PROXY ?? env.http_proxy)?.trim() || undefined;
+}
+
+/** 把域名并入 NO_PROXY（返回新加入的部分）。undici 每次 dispatch 都重读该变量。 */
+function addNoProxyHosts(hosts: string[]): string | undefined {
+  const env = process.env;
+  const current = (env.NO_PROXY ?? env.no_proxy ?? "").trim();
+  if (current === "*") return undefined; // NO_PROXY=* 表示全部直连，无需追加
+  const entries = current.split(",").map((s) => s.trim()).filter(Boolean);
+  const seen = new Set(entries.map((s) => s.toLowerCase()));
+  const added: string[] = [];
+  for (const host of hosts) {
+    const h = host.trim().toLowerCase();
+    if (!h || seen.has(h)) continue;
+    seen.add(h);
+    entries.push(h);
+    added.push(h);
+  }
+  if (!added.length) return undefined;
+  env.NO_PROXY = entries.join(",");
+  return added.join(",");
+}
+
+/**
+ * 有全局代理时，保证「该直连的东西」不被它代理：本地 detour + DETOUR_DIRECT_HOSTS。
+ * 幂等，可重复调用（例如 /reload 后）。
+ */
+function applyDirectBypass(cfg: DetourConfig): void {
+  if (!globalProxyEnv()) return;
+  const added = addNoProxyHosts([parseHostPort(cfg.baseUrl).host, "localhost", ...cfg.directHosts]);
+  if (added) state.noProxyAdded = [state.noProxyAdded, added].filter(Boolean).join(",");
+}
+
+/** 需要改写 baseUrl 的 provider 白名单（默认只有 opencode-go）。 */
+function rewriteTargets(cfg: DetourConfig): string[] {
+  return [PRIMARY_PROVIDER, ...cfg.extraProviders];
+}
+
 function findDetour(): { bin: string; script?: string } | undefined {
   const env = process.env;
   const candidates: string[] = [];
@@ -119,6 +181,8 @@ function loadConfig(): DetourConfig {
     mode: resolveMode(),
     autoStart: env.PI_DETOUR_AUTO_START !== "0",
     extraProviders: (env.DETOUR_EXTRA_PROVIDERS ?? "")
+      .split(",").map((s) => s.trim()).filter(Boolean),
+    directHosts: (env.DETOUR_DIRECT_HOSTS ?? "")
       .split(",").map((s) => s.trim()).filter(Boolean),
     bin: found?.bin,
     script: found?.script,
@@ -238,12 +302,15 @@ function fmtConfig(cfg: DetourConfig): string {
   return [
     `本地地址   ${cfg.baseUrl}`,
     `上游       ${cfg.upstream}`,
-    `代理       ${cfg.proxy}`,
+    `代理       ${cfg.proxy}（只用于 detour 这一条链路）`,
     `模式       ${cfg.mode}${cfg.mode === "auto" ? `（本次: ${state.directOk ? "直连" : "经 detour"}）` : ""}`,
     `自动拉起   ${cfg.autoStart ? "开" : "关 (PI_DETOUR_AUTO_START=0)"}`,
+    `改写 provider ${rewriteTargets(cfg).join(", ")}（其余 provider 一律直连）`,
+    `全局代理   ${globalProxyEnv() ?? "未设置（各 provider 按自身 baseUrl 直连）"}`,
+    state.noProxyAdded ? `NO_PROXY 直连 ${state.noProxyAdded}` : "",
+    cfg.directHosts.length ? `直连域名   ${cfg.directHosts.join(", ")}` : "",
     `detour 二进制 ${cfg.bin ? cfg.bin : "(未找到)"}`,
     cfg.script ? `管理脚本   ${cfg.script}` : "",
-    cfg.extraProviders.length ? `额外 provider: ${cfg.extraProviders.join(", ")}` : "",
   ].filter(Boolean).join("\n");
 }
 
@@ -256,10 +323,14 @@ export default async function (pi: ExtensionAPI) {
   else state.directOk = await probeDirect(cfg.upstream);
   state.mode = cfg.mode;
 
+  // 若进程里已有全局代理，先让该直连的域名豁免（opencode 本身仍可由全局代理覆盖，
+  // 但本地 detour 与 DETOUR_DIRECT_HOSTS 必须直连，否则 qwen 之类也会被代理）。
+  applyDirectBypass(cfg);
+
   if (!state.directOk) {
-    // 直连不可用（或强制走 detour）：覆盖 baseUrl，保留内置模型与 OPENCODE_API_KEY 认证。
-    pi.registerProvider("opencode-go", { baseUrl: cfg.baseUrl });
-    for (const name of cfg.extraProviders) {
+    // 直连不可用（或强制走 detour）：只覆盖白名单里的 provider，逐个注册，
+    // 保留它们的内置模型与认证。绝不动 qwen-token-plan 等其它 provider。
+    for (const name of rewriteTargets(cfg)) {
       pi.registerProvider(name, { baseUrl: cfg.baseUrl });
     }
   }
@@ -268,6 +339,18 @@ export default async function (pi: ExtensionAPI) {
   // 2) session 开始：确保 detour 在跑（仅当需要走 detour），并提示直连/转发状态。
   pi.on("session_start", async (_event, ctx) => {
     const current = loadConfig();
+    applyDirectBypass(current); // 幂等：把该直连的域名持续挡在全局代理之外
+
+    // 全局代理是「所有请求都走代理」的唯一来源：pi 的 HTTP 层对每个 provider 都
+    // 生效，qwen token-plan 也会被带上。说清楚，并给出让指定域名直连的办法。
+    const globalProxy = globalProxyEnv();
+    if (globalProxy && ctx.hasUI) {
+      ctx.ui.notify([
+        `检测到全局代理 ${globalProxy}：pi 会让所有 provider 都走它（qwen token-plan 也不例外）。`,
+        state.noProxyAdded ? `已加入 NO_PROXY 保持直连: ${state.noProxyAdded}` : undefined,
+        "要豁免更多域名：DETOUR_DIRECT_HOSTS=host1,host2；最省事的做法是不设全局代理，opencode 交给 detour。",
+      ].filter(Boolean).join("\n"), "warning");
+    }
 
     if (state.directOk) {
       if (ctx.hasUI) {
@@ -341,10 +424,13 @@ export default async function (pi: ExtensionAPI) {
               ? "当前直连 opencode.ai，不走代理"
               : `detour: ${up ? "运行中" : "未运行"} (${current.baseUrl})`,
             up ? `链路: ${probe?.ok ? "正常" : `异常 (${probe?.error ?? `HTTP ${probe?.status}`})`}` : "链路: 未探测（detour 未运行）",
+            `改写 provider: ${rewriteTargets(current).join(", ")}（其余直连）`,
             `上游: ${current.upstream}`,
-            `代理: ${current.proxy}`,
+            `代理: ${current.proxy}（仅 detour 链路）`,
+            `全局代理: ${globalProxyEnv() ?? "未设置（qwen 等 provider 直连）"}`,
+            state.noProxyAdded ? `NO_PROXY 直连: ${state.noProxyAdded}` : "",
             current.bin ? `二进制: ${current.bin}` : "二进制: 未找到（DETOUR_BIN 或 detour.sh）",
-          ].join("\n"), state.directOk ? "info" : (probe?.ok === false ? "warning" : "info"));
+          ].filter(Boolean).join("\n"), state.directOk ? "info" : (probe?.ok === false ? "warning" : "info"));
           return;
         }
         case "start": {
