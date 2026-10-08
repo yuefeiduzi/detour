@@ -117,7 +117,8 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.NAME }}
-          path: ${{ env.NAME }}.${{ matrix.archive }}
+          # 打包脚本把制品写在 dist/ 下（.gitignore 里），别再漏掉这层目录。
+          path: dist/${{ env.NAME }}.${{ matrix.archive }}
           if-no-files-found: error
 
   publish:
