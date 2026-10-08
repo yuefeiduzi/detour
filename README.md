@@ -50,7 +50,8 @@ go build -o detour .      # 单文件静态二进制，零依赖，拷到公司�
 启动后：
 
 ```
-detour 0.3.0 listening on http://127.0.0.1:8787
+detour 0.4.0 listening on http://127.0.0.1:8787
+  config: /Users/you/.detour/detour.json
   upstream: https://opencode.ai/zen/go/v1/
   proxy: http://127.0.0.1:7897
 ```
@@ -79,16 +80,23 @@ detour 0.3.0 listening on http://127.0.0.1:8787
 ## 二、修改代理 IP / 端口（三种方式）
 
 梯子代理地址（`-proxy`）和本地监听地址（`-listen`）、上游地址（`-upstream`）
-都有三种配置方式，**优先级：命令行参数 > 配置文件 > 环境变量 > 内置默认值**。
+都有四种来源，**优先级：命令行参数 > 配置文件 > 环境变量 > 内置默认值**。
+拿不准现在吃的是哪套：`./detour -print-config`（打印生效配置 JSON），
+或 `./detour.sh status`。
 
 ### 方式一：环境变量（最常用，改端口最快）
 
 ```bash
-export DETOUR_PROXY=http://127.0.0.1:7897      # 代理地址（http / socks5 均可）
-export DETOUR_LISTEN=127.0.0.1:8787            # 本地监听地址
+set   DETOUR_PROXY=http://127.0.0.1:7897   # Windows cmd
+export DETOUR_PROXY=http://127.0.0.1:7897  # macOS / Linux（代理地址，http / socks5 均可）
+export DETOUR_LISTEN=127.0.0.1:8787        # 本地监听地址
 export DETOUR_UPSTREAM=https://opencode.ai/zen/go/v1/   # 上游 API 地址
-./detour.sh start                              # 设置后再启动
+export DETOUR_CONFIG=/path/to/detour.json  # 指定配置文件（可选）
+./detour.sh start                          # 设置后再启动
 ```
+
+只有**显式设置**的那一项才会覆盖配置文件；没设的项交给 `detour.json` 和内置默认值。
+裸二进制（Windows 的 `detour.exe`、没装 bash 的机器）同样认这几个环境变量。
 
 **常见梯子端口对照：**
 
@@ -102,9 +110,15 @@ export DETOUR_UPSTREAM=https://opencode.ai/zen/go/v1/   # 上游 API 地址
 
 不想走代理时用 `direct`：`export DETOUR_PROXY=direct`。
 
-### 方式二：配置文件（`detour.json`）
+### 方式二：配置文件（默认 `~/.detour/detour.json`）
 
-参考 `detour.example.json`，所有参数写进文件：
+参考 `detour.example.json`，所有参数写进文件。**默认位置是用户目录下的
+`.detour/detour.json`**（Windows 是 `C:\Users\<你>\.detour\detour.json`），
+与二进制放哪、从哪个目录启动都无关：
+
+```bash
+mkdir -p ~/.detour && cp detour.example.json ~/.detour/detour.json
+```
 
 ```json
 {
@@ -115,13 +129,18 @@ export DETOUR_UPSTREAM=https://opencode.ai/zen/go/v1/   # 上游 API 地址
 }
 ```
 
+查找顺序（第一个存在的生效）：`-config` / `$DETOUR_CONFIG` → `~/.detour/detour.json`
+→ 二进制同目录 → 当前目录。所以仓库里放一份 `detour.json` 做实验也还能用，
+但注意用户目录那份优先。
+
 ```bash
-./detour.sh start        # 启动时自动读取同目录 detour.json
-./detour -config detour.json   # 或显式指定配置文件
+./detour.sh start              # 启动时自动加载（就是上面这个顺序）
+./detour -config detour.json   # 或显式指定某个文件
+./detour -print-config         # 看此刻到底读了哪个文件
 ```
 
-> ⚠️ `detour.json` 已被 `.gitignore` 忽略，不会提交到仓库；里面可能含代理
-> 认证信息，不要改名后提交。
+> ⚠️ `detour.json` 已被 `.gitignore` 忽略；里面可能含代理认证信息，
+> 别改个名字提交到仓库。
 
 ### 方式三：命令行参数（临时/测试用）
 
@@ -130,7 +149,32 @@ export DETOUR_UPSTREAM=https://opencode.ai/zen/go/v1/   # 上游 API 地址
          -upstream https://opencode.ai/zen/go/v1/ \
          -proxy socks5://127.0.0.1:1080
 ./detour -proxy direct    # 直连（测试用）
+./detour -print-config    # 打印生效配置后退出（默认值 + detour.json + 环境变量）
 ```
+
+### Windows 用法（没有 bash）
+
+`detour.sh` 依赖 bash + `nohup`/`ps`/`lsof`，Windows 上不要用它，直接跑 exe：
+
+在开始处加上：
+
+```bat
+:: 1. 写配置到用户目录（推荐；也可以放 exe 同目录）
+mkdir "%USERPROFILE%\.detour"
+notepad "%USERPROFILE%\.detour\detour.json"
+::    {"listen":"127.0.0.1:8787","upstream":"https://opencode.ai/zen/go/v1/","proxy":"http://127.0.0.1:7890"}
+
+:: 2. 看生效配置 / 体检链路（会打印它读的配置文件路径和连的梯子端口）
+detour.exe -print-config
+detour.exe -check
+
+:: 3. 启动（前台；也可以 start /b detour.exe 让它待在后台）
+detour.exe
+```
+
+`detour.exe` 按 `%USERPROFILE%\.detour\detour.json` → exe 同目录 → 当前目录的顺序找配置；
+没有配置文件时用内置默认值，所以临时改端口只要
+`set DETOUR_PROXY=http://127.0.0.1:7890` 再启动即可。
 
 ### 配置项一览
 
@@ -141,7 +185,8 @@ export DETOUR_UPSTREAM=https://opencode.ai/zen/go/v1/   # 上游 API 地址
 | `-proxy` / `DETOUR_PROXY` | `http://127.0.0.1:7897` | 梯子代理，`http://` / `socks5://` / `direct` |
 | `-v` | 关 | 详细日志（打印请求头，Authorization 脱敏） |
 | `-check` | — | 体检代理链路后退出 |
-| `-config` | — | 指定配置文件 |
+| `-print-config` | — | 打印生效配置（JSON）后退出 |
+| `-config` / `DETOUR_CONFIG` | `~/.detour/detour.json` | 配置文件；查找顺序：本项 → `~/.detour/detour.json` → exe 同目录 → 当前目录 |
 | `-tls-cert` / `-tls-key` | 无 | 用 HTTPS 提供本地服务（个别 SDK 不接受 http） |
 
 ---
@@ -193,8 +238,10 @@ minimax-m3 等），直接开聊。
   `settings.json` 的 `httpProxy`），pi 会让**所有** provider 都走它（qwen 也一样）。
   此时插件会把本地 detour 与 `DETOUR_DIRECT_HOSTS` 写进 `NO_PROXY` 保持直连，
   并在会话启动时告警。用 `/detour env` 可查看。
-- **自动拉起 detour**：detour 没在跑时，自动用 `detour.sh start` 拉起来
-  （监听、上游、代理参数跟随你的 detour 配置）。`PI_DETOUR_AUTO_START=0` 可关闭。
+- **自动拉起 detour**：detour 没在跑时自动拉起——Unix 上用 `detour.sh start`，
+  Windows 上直接 spawn `detour.exe`（没有 bash/nohup）。只把你**显式设置**的
+  `DETOUR_*` 作为参数传下去，其余跟随二进制自己的配置（`detour.json` > 默认值），
+  不会拿默认的 7897 盖掉你写好的配置。`PI_DETOUR_AUTO_START=0` 可关闭。
 
 ### 插件内管理命令
 
@@ -217,8 +264,9 @@ minimax-m3 等），直接开聊。
 | `DETOUR_BASE_URL` | `http://127.0.0.1:8787` | 本地 detour 地址（完整 URL） |
 | `DETOUR_LISTEN` | `127.0.0.1:8787` | 兼容 detour.sh 的 host:port 写法 |
 | `DETOUR_UPSTREAM` | `https://opencode.ai/zen/go/v1/` | 实际上游地址 |
-| `DETOUR_PROXY` | `http://127.0.0.1:7897` | 梯子代理（改端口在这里） |
-| `DETOUR_BIN` | 自动查找 | detour 二进制路径（查找顺序：本变量 → 插件同级 ../detour → ~/self-git/detour/detour → PATH） |
+| `DETOUR_PROXY` | `http://127.0.0.1:7897` | 梯子代理（改端口在这里）；不设则用二进制报告的 `detour.json` 值 |
+| `DETOUR_CONFIG` | — | 指定 `detour.json` 路径（不设则用二进制旁的 detour.json） |
+| `DETOUR_BIN` | 自动查找 | detour 二进制路径（查找顺序：本变量 → 插件同级 ../detour → ~/self-git/detour/detour → PATH；Windows 自动补 `.exe`） |
 | `DETOUR_EXTRA_PROVIDERS` | 空 | 逗号分隔的额外 provider 名，同样指到本地 detour |
 | `DETOUR_DIRECT_HOSTS` | 空 | 逗号分隔域名。存在全局代理时写进 `NO_PROXY` 强制直连（如 qwen token-plan 的域名） |
 | `PI_DETOUR_AUTO_START` | 开 | 设 `0` 关闭自动拉起 detour |
@@ -286,11 +334,12 @@ minimax-m3 等），直接开聊。
 
 ```bash
 ./detour.sh start                       # 后台启动
-./detour.sh status                      # 状态
+./detour.sh status                      # 状态（含生效配置与来源）
 ./detour.sh check                       # 体检代理链路
 ./detour.sh log                         # 跟踪日志
 ./detour.sh stop                        # 停止
 ./detour -config detour.json            # 用配置文件启动
+./detour -print-config                  # 看当前生效的监听/上游/代理
 ./detour -proxy socks5://127.0.0.1:1080 # 换 socks5 代理
 ./detour -v                             # 详细日志（请求头，Authorization 脱敏）
 ./detour -check                         # 命令行体检，然后退出
@@ -305,6 +354,11 @@ minimax-m3 等），直接开聊。
   （Clash Verge 的"规则"页面可以看到）。
 - **请求返回 502**：detour 连不上上游，看日志里的 `upstream error` 一行；
   多半是梯子没开会话、节点失效、或 `DETOUR_PROXY` 端口写错。
+  502 的响应体会直接点名它连的是哪个代理，例如：
+  `upstream request failed: proxyconnect tcp: dial tcp 127.0.0.1:7897: connection refused
+  (proxy http://127.0.0.1:7897: is your ladder running on that port?)` —— 看到这句就是端口不对：
+  用 `detour -print-config` 确认生效端口，`netstat -ano | findstr LISTENING`（Windows）
+  或 Clash 设置里看梯子真实端口，然后 `detour -proxy http://127.0.0.1:<真实端口>` 重启。
 - **pi 提示"链路异常"**：同上，检查梯子与代理规则。
 - **opencode 报 models.dev 相关错误**：opencode 会从 models.dev 拉模型元数据，
   如果它也被墙，给 models.dev 单独配代理规则即可。

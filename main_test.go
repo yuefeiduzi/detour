@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -458,5 +459,158 @@ func TestUpstreamError(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "error") {
 		t.Fatalf("body = %q, want JSON error", body)
+	}
+}
+
+// --- configuration precedence -------------------------------------------------
+
+func fakeEnv(pairs map[string]string) func(string) string {
+	return func(key string) string { return pairs[key] }
+}
+
+func TestDefaultsWhenNothingIsSet(t *testing.T) {
+	cfg, err := loadConfig("", fakeEnv(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Listen != defaultListen || cfg.Upstream != defaultUpstream || cfg.Proxy != defaultProxy {
+		t.Fatalf("got %+v, want the built-in defaults", cfg)
+	}
+}
+
+func TestEnvVarsFillInDefaults(t *testing.T) {
+	cfg, err := loadConfig("", fakeEnv(map[string]string{
+		envListen:   "127.0.0.1:9999",
+		envUpstream: "https://env.example/v1",
+		envProxy:    "socks5://127.0.0.1:1080",
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Listen != "127.0.0.1:9999" {
+		t.Errorf("Listen = %q, want the env value", cfg.Listen)
+	}
+	if cfg.Upstream != "https://env.example/v1" {
+		t.Errorf("Upstream = %q, want the env value", cfg.Upstream)
+	}
+	if cfg.Proxy != "socks5://127.0.0.1:1080" {
+		t.Errorf("Proxy = %q, want the env value", cfg.Proxy)
+	}
+}
+
+func TestEmptyEnvVarsAreIgnored(t *testing.T) {
+	cfg, err := loadConfig("", fakeEnv(map[string]string{envProxy: "   ", envListen: ""}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Proxy != defaultProxy || cfg.Listen != defaultListen {
+		t.Fatalf("got %+v, want defaults for blank env vars", cfg)
+	}
+}
+
+func TestConfigFileBeatsEnvVarsAndEnvFillsGaps(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "detour.json")
+	if err := os.WriteFile(path, []byte(`{"proxy":"http://127.0.0.1:7890"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path, fakeEnv(map[string]string{
+		envListen: "127.0.0.1:9999",
+		envProxy:  "http://127.0.0.1:7897", // loses to the file
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Proxy != "http://127.0.0.1:7890" {
+		t.Errorf("Proxy = %q, want the config file value", cfg.Proxy)
+	}
+	if cfg.Listen != "127.0.0.1:9999" {
+		t.Errorf("Listen = %q, want the env value (file does not set it)", cfg.Listen)
+	}
+	if cfg.Upstream != defaultUpstream {
+		t.Errorf("Upstream = %q, want the built-in default", cfg.Upstream)
+	}
+}
+
+// fakeHome 把 HOME/USERPROFILE 指向临时目录，让 discoverConfig 不依赖跑测试的机器。
+func fakeHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // Windows
+	return home
+}
+
+func TestDiscoverConfigFindsDetourJSONInHomeDotDetour(t *testing.T) {
+	home := fakeHome(t)
+	t.Chdir(home) // 别让仓库/工作目录里的 detour.json 干扰“什么都没有”的判断
+	if got := discoverConfig(); got != "" {
+		t.Fatalf("discoverConfig() = %q, want empty before any config exists", got)
+	}
+	dir := filepath.Join(home, ".detour")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, defaultConfigName)
+	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := discoverConfig(); got != path {
+		t.Fatalf("discoverConfig() = %q, want %q", got, path)
+	}
+	if got := defaultConfigPath(); got != path {
+		t.Fatalf("defaultConfigPath() = %q, want %q", got, path)
+	}
+}
+
+func TestDiscoverConfigPrefersHomeThenCwd(t *testing.T) {
+	home := fakeHome(t)
+	cwd := t.TempDir()
+	t.Chdir(cwd)
+	cwdPath := filepath.Join(cwd, defaultConfigName)
+	if err := os.WriteFile(cwdPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := discoverConfig(); got != cwdPath {
+		t.Fatalf("discoverConfig() = %q, want the cwd file %q when home has none", got, cwdPath)
+	}
+	homeDir := filepath.Join(home, ".detour")
+	if err := os.MkdirAll(homeDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	homePath := filepath.Join(homeDir, defaultConfigName)
+	if err := os.WriteFile(homePath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := discoverConfig(); got != homePath {
+		t.Fatalf("discoverConfig() = %q, want the user-level file %q to win", got, homePath)
+	}
+}
+
+func TestLoadConfigReadsUserLevelFile(t *testing.T) {
+	home := fakeHome(t)
+	dir := filepath.Join(home, ".detour")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, defaultConfigName),
+		[]byte(`{"proxy":"http://127.0.0.1:7890","listen":"127.0.0.1:18888"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(discoverConfig(), fakeEnv(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Proxy != "http://127.0.0.1:7890" || cfg.Listen != "127.0.0.1:18888" {
+		t.Fatalf("got %+v, want the values from ~/.detour/detour.json", cfg)
+	}
+}
+
+func TestProxyHintNamesTheProxy(t *testing.T) {
+	hint := proxyHint(&Config{Proxy: "http://127.0.0.1:7890"})
+	if !strings.Contains(hint, "127.0.0.1:7890") {
+		t.Errorf("proxyHint = %q, want the proxy address in it", hint)
+	}
+	if !strings.Contains(proxyHint(&Config{Proxy: "direct"}), "direct") {
+		t.Error("proxyHint should mention direct mode")
 	}
 }

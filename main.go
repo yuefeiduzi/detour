@@ -15,17 +15,29 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 )
 
-const version = "0.3.0"
+const version = "0.4.0"
 
 const (
-	defaultListen   = "127.0.0.1:8787"
-	defaultUpstream = "https://api.openai.com/v1"
-	defaultProxy    = "http://127.0.0.1:7897"
+	defaultListen     = "127.0.0.1:8787"
+	defaultUpstream   = "https://api.openai.com/v1"
+	defaultProxy      = "http://127.0.0.1:7897"
+	defaultConfigName = "detour.json"
+)
+
+// Environment variables. They sit between the config file and the built-in
+// defaults, so a bare binary (no detour.sh — e.g. on Windows) can still be
+// configured without touching command-line flags.
+const (
+	envListen   = "DETOUR_LISTEN"
+	envUpstream = "DETOUR_UPSTREAM"
+	envProxy    = "DETOUR_PROXY"
+	envConfig   = "DETOUR_CONFIG"
 )
 
 // Config is the effective configuration; JSON field names match the config file.
@@ -50,8 +62,60 @@ func (c *Config) applyDefaults() {
 	}
 }
 
-func loadConfig(path string) (*Config, error) {
+// applyEnv overlays DETOUR_* environment variables onto cfg. Empty values are
+// ignored so that "unset" and "empty" behave the same.
+func applyEnv(cfg *Config, getenv func(string) string) {
+	if v := strings.TrimSpace(getenv(envListen)); v != "" {
+		cfg.Listen = v
+	}
+	if v := strings.TrimSpace(getenv(envUpstream)); v != "" {
+		cfg.Upstream = v
+	}
+	if v := strings.TrimSpace(getenv(envProxy)); v != "" {
+		cfg.Proxy = v
+	}
+}
+
+// defaultConfigPath is the canonical per-user location for detour.json:
+// ~/.detour/detour.json  (C:\Users\<name>\.detour\detour.json on Windows).
+// It works no matter where the binary lives or which directory it was started
+// from, which is what a user-level setting needs.
+func defaultConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ""
+	}
+	return filepath.Join(home, ".detour", defaultConfigName)
+}
+
+// discoverConfig finds the config file: the per-user default first, then next to
+// the executable, then in the working directory. Returns "" when there is none,
+// so running the binary with no config file keeps working as before.
+func discoverConfig() string {
+	candidates := []string{defaultConfigPath()}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), defaultConfigName))
+	}
+	if wd, err := os.Getwd(); err == nil {
+		candidates = append(candidates, filepath.Join(wd, defaultConfigName))
+	}
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// loadConfig builds the effective configuration.
+// Precedence, low to high: built-in defaults < DETOUR_* env vars < config file
+// < command-line flags (applied by parseFlags).
+func loadConfig(path string, getenv func(string) string) (*Config, error) {
 	cfg := &Config{}
+	applyEnv(cfg, getenv)
 	cfg.applyDefaults()
 	if path == "" {
 		return cfg, nil
@@ -67,16 +131,51 @@ func loadConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
-func parseFlags(cfg *Config) {
-	configPath := flag.String("config", "", "path to a JSON config file (optional)")
-	listen := flag.String("listen", "", "listen address, e.g. 127.0.0.1:8787 (overrides config file)")
-	upstream := flag.String("upstream", "", "real API base URL, e.g. https://api.openai.com/v1 (overrides config file)")
-	proxy := flag.String("proxy", "", "proxy URL: http://127.0.0.1:7897 or socks5://127.0.0.1:7891; \"direct\" for no proxy (overrides config file)")
+// printConfig writes the effective configuration as one line of JSON, plus the
+// config file path on stderr. Scripts (detour.sh, the pi extension) use this
+// instead of guessing which of defaults/config/env won.
+func printConfig(cfg *Config, configPath string) {
+	effective := map[string]any{
+		"listen":   cfg.Listen,
+		"upstream": cfg.Upstream,
+		"proxy":    cfg.Proxy,
+		"verbose":  cfg.Verbose,
+		"config":   configPath,
+	}
+	if cfg.TLSCert != "" {
+		effective["tls_cert"] = cfg.TLSCert
+		effective["tls_key"] = cfg.TLSKey
+	}
+	out, err := json.Marshal(effective)
+	if err != nil {
+		log.Fatalf("print config: %v", err)
+	}
+	if configPath != "" {
+		log.Printf("config file: %s", configPath)
+	}
+	fmt.Println(string(out))
+}
+
+// proxyHint is appended to upstream failures: a wrong ladder port (or a ladder
+// that is not running) is by far the most common cause.
+func proxyHint(cfg *Config) string {
+	if cfg.Proxy == "" || cfg.Proxy == "direct" {
+		return " (detour runs in direct mode — no proxy configured)"
+	}
+	return fmt.Sprintf(" (proxy %s: is your ladder running on that port? set -proxy/DETOUR_PROXY, or run `detour -check`)", cfg.Proxy)
+}
+
+func parseFlags(cfg *Config) string {
+	configPath := flag.String("config", "", "path to a JSON config file (default: $DETOUR_CONFIG, else ~/.detour/detour.json, then next to the binary / in the cwd)")
+	listen := flag.String("listen", "", "listen address, e.g. 127.0.0.1:8787 (overrides config file and $DETOUR_LISTEN)")
+	upstream := flag.String("upstream", "", "real API base URL, e.g. https://api.openai.com/v1 (overrides config file and $DETOUR_UPSTREAM)")
+	proxy := flag.String("proxy", "", "proxy URL: http://127.0.0.1:7897 or socks5://127.0.0.1:7891; \"direct\" for no proxy (overrides config file and $DETOUR_PROXY)")
 	verbose := flag.Bool("v", false, "verbose: log request headers")
 	check := flag.Bool("check", false, "probe connectivity through the proxy, then exit")
 	tlsCert := flag.String("tls-cert", "", "serve HTTPS using this certificate (PEM)")
 	tlsKey := flag.String("tls-key", "", "serve HTTPS using this key (PEM)")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	showConfig := flag.Bool("print-config", false, "print the effective configuration as JSON and exit")
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
 		fmt.Fprintf(out, `detour %s - local model API relay through your proxy
@@ -91,9 +190,12 @@ Examples:
   detour -proxy socks5://127.0.0.1:7891         # SOCKS5 proxy
   detour -proxy direct                          # no proxy (testing only)
   detour -check                                 # verify the proxy chain works
+  detour -print-config                          # which settings actually apply
   detour -config detour.json                    # all settings from a file
 
-Precedence: command-line flags > config file > built-in defaults.
+Env vars: DETOUR_LISTEN, DETOUR_UPSTREAM, DETOUR_PROXY, DETOUR_CONFIG.
+Config file lookup: ~/.detour/detour.json, then next to the binary, then the cwd.
+Precedence: flags > config file > env vars > built-in defaults.
 
 Usage of detour:
 `, version)
@@ -106,13 +208,18 @@ Usage of detour:
 		os.Exit(0)
 	}
 
-	if *configPath != "" {
-		loaded, err := loadConfig(*configPath)
-		if err != nil {
-			log.Fatalf("config: %v", err)
-		}
-		*cfg = *loaded
+	resolvedPath := *configPath
+	if resolvedPath == "" {
+		resolvedPath = strings.TrimSpace(os.Getenv(envConfig))
 	}
+	if resolvedPath == "" {
+		resolvedPath = discoverConfig()
+	}
+	loaded, err := loadConfig(resolvedPath, os.Getenv)
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	*cfg = *loaded
 	if *listen != "" {
 		cfg.Listen = *listen
 	}
@@ -135,10 +242,15 @@ Usage of detour:
 		log.Fatal("tls-cert and tls-key must be provided together")
 	}
 	cfg.applyDefaults() // fill anything still unset
+	if *showConfig {
+		printConfig(cfg, resolvedPath)
+		os.Exit(0)
+	}
 	if *check {
 		runCheck(cfg)
 		os.Exit(0)
 	}
+	return resolvedPath
 }
 
 // buildTransport returns an http.Transport that routes through cfg.Proxy.
@@ -225,13 +337,13 @@ func newRelay(cfg *Config, tr *http.Transport) (http.Handler, error) {
 			pr.SetXForwarded()
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("upstream error: %s %s -> %s: %v", r.Method, r.URL.Path, upstream.Host, err)
+			log.Printf("upstream error: %s %s -> %s: %v%s", r.Method, r.URL.Path, upstream.Host, err, proxyHint(cfg))
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
 			msg, _ := json.Marshal(map[string]any{
 				"error": map[string]any{
 					"type":    "detour_upstream_error",
-					"message": "upstream request failed: " + err.Error(),
+					"message": "upstream request failed: " + err.Error() + proxyHint(cfg),
 				},
 			})
 			io.WriteString(w, string(msg))
@@ -374,7 +486,7 @@ func isLoopback(addr string) bool {
 func main() {
 	log.SetFlags(log.LstdFlags)
 	var cfg Config
-	parseFlags(&cfg) // may os.Exit (check/version modes, fatal errors)
+	configPath := parseFlags(&cfg) // may os.Exit (check/version modes, fatal errors)
 
 	tr, err := buildTransport(&cfg)
 	if err != nil {
@@ -398,6 +510,11 @@ func main() {
 		log.Printf("WARNING: listening on %s — the relay forwards your API keys; keep it on 127.0.0.1 unless you know what you're doing", cfg.Listen)
 	}
 	log.Printf("detour %s listening on %s://%s", version, scheme, ln.Addr())
+	if configPath != "" {
+		log.Printf("  config: %s", configPath)
+	} else if hint := defaultConfigPath(); hint != "" {
+		log.Printf("  config: none (default location would be %s)", hint)
+	}
 	log.Printf("  upstream: %s", cfg.Upstream)
 	if cfg.Proxy == "" || cfg.Proxy == "direct" {
 		log.Printf("  proxy: direct (no proxy)")

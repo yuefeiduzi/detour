@@ -29,24 +29,33 @@
  *   DETOUR_LISTEN        兼容 detour.sh 的写法（host:port），默认 127.0.0.1:8787
  *   DETOUR_UPSTREAM      实际上游，默认 https://opencode.ai/zen/go/v1/
  *   DETOUR_PROXY         梯子代理，默认 http://127.0.0.1:7897
+ *   DETOUR_CONFIG        指定 detour.json 路径（不设则按 ~/.detour/detour.json →
+ *                        二进制同目录 → 当前目录 的顺序自动找）
  *   DETOUR_BIN           detour 二进制路径（默认自动查找：扩展同级的 ../detour、
- *                        ~/self-git/detour/detour、PATH）
+ *                        ~/self-git/detour/detour、PATH；Windows 自动补 .exe）
  *   DETOUR_EXTRA_PROVIDERS 逗号分隔的额外 provider 名，同样改写 baseUrl 到本地
  *   DETOUR_DIRECT_HOSTS  逗号分隔域名，存在全局代理时强制直连（写入 NO_PROXY），
  *                        例如 token-plan.cn-beijing.maas.aliyuncs.com
  *   PI_DETOUR_AUTO_START 设为 0 关闭自动拉起 detour
+ *
+ * 监听 / 上游 / 代理三项的取值顺序：环境变量 > 配置文件（默认 ~/.detour/detour.json，
+ * 用 `detour -print-config` 问二进制要最终生效值）> 内置默认值。只有显式设置的环境变量
+ * 才会作为命令行参数传给 detour，所以不会拿默认值去盖掉你自己的 detour.json。
  */
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { connect } from "node:net";
 import { existsSync, openSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const EXT_DIR = typeof __dirname !== "undefined"
   ? __dirname
   : dirname(fileURLToPath(import.meta.url));
+
+const IS_WINDOWS = process.platform === "win32";
+const EXE_NAMES = IS_WINDOWS ? ["detour.exe", "detour"] : ["detour"];
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:8787";
 const DEFAULT_UPSTREAM = "https://opencode.ai/zen/go/v1/";
@@ -58,6 +67,14 @@ const PRIMARY_PROVIDER = "opencode-go";
 
 type DetourMode = "auto" | "always" | "never";
 
+/** 只有显式来自环境变量的项才会作为命令行参数传给 detour。 */
+interface DetourOverrides {
+  config?: string;
+  listen?: string;
+  upstream?: string;
+  proxy?: string;
+}
+
 interface DetourConfig {
   baseUrl: string;          // full local URL, no trailing slash, e.g. http://127.0.0.1:8787
   listen: string;           // host:port form for detour flags
@@ -67,25 +84,58 @@ interface DetourConfig {
   autoStart: boolean;
   extraProviders: string[];
   directHosts: string[];     // 有全局代理时仍要直连的域名（写入 NO_PROXY）
+  overrides: DetourOverrides;
   bin?: string;             // detour binary path found
-  script?: string;          // detour.sh path found next to the binary
+  script?: string;          // detour.sh path found next to the binary (never on Windows)
+  configFile?: string;      // detour.json the binary reported as effective
 }
 
 interface RuntimeState {
   directOk: boolean;        // true = 直连可达，直接走上游（不覆盖、不拉起 detour）
   mode: DetourMode;
   noProxyAdded?: string;    // 本次写进 NO_PROXY 的直连域名，供 /detour 显示
+  spawnedPid?: number;      // 本插件拉起的 detour 进程，Windows 上用它来 stop
 }
 
 const state: RuntimeState = { directOk: true, mode: "auto" };
 
-function resolveBaseUrl(): string {
+/** baseUrl 优先看 DETOUR_BASE_URL，其次 DETOUR_LISTEN / detour 实际监听的地址。 */
+function resolveBaseUrl(effective?: EffectiveConfig): string {
   const env = process.env;
   const explicit = env.DETOUR_BASE_URL?.trim();
   if (explicit) return explicit.replace(/\/+$/, "");
-  const listen = env.DETOUR_LISTEN?.trim();
+  const listen = env.DETOUR_LISTEN?.trim() || effective?.listen;
   if (listen) return `http://${listen.replace(/^https?:\/\//, "")}`;
   return DEFAULT_BASE_URL;
+}
+
+/** 带路径分隔符才算路径（Windows 上是 "\"，不能只认 "/"）。 */
+function looksLikePath(candidate: string): boolean {
+  return candidate.includes("/") || candidate.includes("\\");
+}
+
+/** 在 PATH 里找可执行文件（Windows 会补 .exe）。 */
+function whichSync(name: string): string | undefined {
+  const dirs = (process.env.PATH ?? "").split(IS_WINDOWS ? ";" : delimiter);
+  for (const dir of dirs) {
+    if (!dir) continue;
+    const candidate = join(dir, name);
+    const found = existingFile([candidate]);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/** 返回第一个存在的文件；Windows 上给无后缀的名字补 .exe 再试一次。 */
+function existingFile(candidates: string[]): string | undefined {
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (existsSync(candidate)) return candidate;
+    if (IS_WINDOWS && !/\.exe$/i.test(candidate) && existsSync(`${candidate}.exe`)) {
+      return `${candidate}.exe`;
+    }
+  }
+  return undefined;
 }
 
 function resolveMode(): DetourMode {
@@ -156,36 +206,88 @@ function rewriteTargets(cfg: DetourConfig): string[] {
 function findDetour(): { bin: string; script?: string } | undefined {
   const env = process.env;
   const candidates: string[] = [];
-  if (env.DETOUR_BIN?.trim()) candidates.push(env.DETOUR_BIN.trim());
-  candidates.push(join(EXT_DIR, "..", "detour"));            // repo layout: pi-extension/../detour
-  candidates.push(join(homedir(), "self-git", "detour", "detour"));
-  candidates.push("detour");                                 // PATH lookup
-  for (const c of candidates) {
-    if (!c || !c.includes("/")) continue;
-    if (!existsSync(c)) continue;
-    const script = join(dirname(c), "detour.sh");
-    return { bin: c, script: existsSync(script) ? script : undefined };
+  if (env.DETOUR_BIN?.trim()) {
+    const hint = env.DETOUR_BIN.trim();
+    if (looksLikePath(hint)) candidates.push(hint);
+    else candidates.push(whichSync(hint) ?? "");
   }
-  return undefined;
+  for (const name of EXE_NAMES) {
+    candidates.push(join(EXT_DIR, "..", name));                        // repo layout: pi-extension/../detour
+    candidates.push(join(homedir(), "self-git", "detour", name));
+    candidates.push(whichSync(name) ?? "");                            // PATH lookup
+  }
+  const bin = existingFile(candidates);
+  if (!bin) return undefined;
+  const script = join(dirname(bin), "detour.sh");
+  // Windows 没有 bash/nohup/lsof，detour.sh 用不了：直接 spawn 二进制。
+  return { bin, script: !IS_WINDOWS && existsSync(script) ? script : undefined };
+}
+
+interface EffectiveConfig {
+  listen?: string;
+  upstream?: string;
+  proxy?: string;
+  config?: string;
+}
+
+/**
+ * 问二进制它最终生效的配置（内置默认值 + detour.json + DETOUR_* 环境变量）。
+ * 这样 detour.json 里改的端口不会被插件按默认值盖掉，/detour env 显示的也是真值。
+ * 老版本二进制没有 -print-config，直接返回 undefined 退回默认值。
+ */
+function readEffectiveConfig(bin: string): EffectiveConfig | undefined {
+  try {
+    const res = spawnSync(bin, ["-print-config"], {
+      encoding: "utf8",
+      timeout: 5000,
+      windowsHide: true,
+    });
+    if (res.status !== 0 || !res.stdout) return undefined;
+    const parsed = JSON.parse(res.stdout) as Record<string, unknown>;
+    const pick = (key: string): string | undefined => {
+      const value = parsed[key];
+      return typeof value === "string" && value.trim() ? value.trim() : undefined;
+    };
+    return { listen: pick("listen"), upstream: pick("upstream"), proxy: pick("proxy"), config: pick("config") };
+  } catch {
+    return undefined;
+  }
 }
 
 function loadConfig(): DetourConfig {
   const env = process.env;
-  const baseUrl = resolveBaseUrl();
   const found = findDetour();
+  const effective = found ? readEffectiveConfig(found.bin) : undefined;
+  const baseUrl = resolveBaseUrl(effective);
+
+  const explicitListen = env.DETOUR_LISTEN?.trim();
+  const explicitUpstream = env.DETOUR_UPSTREAM?.trim();
+  const explicitProxy = env.DETOUR_PROXY?.trim();
+  const explicitConfig = env.DETOUR_CONFIG?.trim();
+
+  // 只有显式设置的环境变量才传命令行参数，避免用插件的默认值覆盖用户的 detour.json。
+  const overrides: DetourOverrides = {};
+  if (explicitConfig) overrides.config = explicitConfig;
+  if (explicitListen) overrides.listen = explicitListen;
+  else if (env.DETOUR_BASE_URL?.trim()) overrides.listen = listenFromBaseUrl(baseUrl);
+  if (explicitUpstream) overrides.upstream = explicitUpstream;
+  if (explicitProxy) overrides.proxy = explicitProxy;
+
   return {
     baseUrl,
     listen: listenFromBaseUrl(baseUrl),
-    upstream: env.DETOUR_UPSTREAM?.trim() || DEFAULT_UPSTREAM,
-    proxy: env.DETOUR_PROXY?.trim() || DEFAULT_PROXY,
+    upstream: explicitUpstream || effective?.upstream || DEFAULT_UPSTREAM,
+    proxy: explicitProxy || effective?.proxy || DEFAULT_PROXY,
     mode: resolveMode(),
     autoStart: env.PI_DETOUR_AUTO_START !== "0",
     extraProviders: (env.DETOUR_EXTRA_PROVIDERS ?? "")
       .split(",").map((s) => s.trim()).filter(Boolean),
     directHosts: (env.DETOUR_DIRECT_HOSTS ?? "")
       .split(",").map((s) => s.trim()).filter(Boolean),
+    overrides,
     bin: found?.bin,
     script: found?.script,
+    configFile: effective?.config,
   };
 }
 
@@ -234,17 +336,51 @@ async function probeRelay(baseUrl: string, timeoutMs = 6000): Promise<{ ok: bool
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     const res = await fetch(`${baseUrl}/v1/models`, { method: "GET", signal: ctrl.signal });
     clearTimeout(timer);
-    const ok = res.status !== 502;
-    return { ok, status: res.status };
+    if (res.status !== 502) return { ok: true, status: res.status };
+    // 502 = detour 连不上上游。把它的错误原文带出来：通常是梯子不在那个端口上。
+    let detail: string | undefined;
+    try {
+      const body = (await res.json()) as { error?: { message?: string } };
+      const message = body?.error?.message;
+      if (typeof message === "string" && message) detail = message.slice(0, 300);
+    } catch {
+      // 响应不是 JSON：保持 502 状态即可
+    }
+    return { ok: false, status: res.status, error: detail };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
 /**
+ * 只有显式设置的环境变量才转成命令行参数（未设置的不传，交给 detour 自己决定
+ * —— 否则插件的内置默认值会盖掉用户写好的 detour.json）。
+ */
+function spawnArgs(cfg: DetourConfig): string[] {
+  const o = cfg.overrides;
+  const args: string[] = [];
+  if (o.config) args.push("-config", o.config);
+  if (o.listen) args.push("-listen", o.listen);
+  if (o.upstream) args.push("-upstream", o.upstream);
+  if (o.proxy) args.push("-proxy", o.proxy);
+  return args;
+}
+
+/** detour.sh 从环境变量读覆盖项，把「显式设置」的那几项同步给它。 */
+function scriptEnv(cfg: DetourConfig): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  const o = cfg.overrides;
+  if (o.config) env.DETOUR_CONFIG = o.config;
+  if (o.listen) env.DETOUR_LISTEN = o.listen;
+  if (o.upstream) env.DETOUR_UPSTREAM = o.upstream;
+  if (o.proxy) env.DETOUR_PROXY = o.proxy;
+  return env;
+}
+
+/**
  * Start detour if it is not already listening. Prefers detour.sh (manages its
- * own pidfile/log), otherwise spawns the binary directly with a log file next
- * to it. Never touches a detour that is already running.
+ * own pidfile/log) on Unix; on Windows (no bash/nohup/lsof) spawns the binary
+ * directly. Never touches a detour that is already running.
  */
 async function ensureDetour(cfg: DetourConfig): Promise<"already-running" | "started" | "no-binary" | "start-failed"> {
   const { host, port } = parseHostPort(cfg.baseUrl);
@@ -253,22 +389,20 @@ async function ensureDetour(cfg: DetourConfig): Promise<"already-running" | "sta
 
   if (cfg.script) {
     spawn("bash", [cfg.script, "start"], {
-      env: {
-        ...process.env,
-        DETOUR_LISTEN: cfg.listen,
-        DETOUR_UPSTREAM: cfg.upstream,
-        DETOUR_PROXY: cfg.proxy,
-      },
+      env: scriptEnv(cfg),
       detached: true,
       stdio: "ignore",
     }).unref();
   } else {
     const logPath = join(dirname(cfg.bin), "detour.log");
     const fd = openSync(logPath, "a");
-    spawn(cfg.bin, ["-listen", cfg.listen, "-upstream", cfg.upstream, "-proxy", cfg.proxy], {
+    const child = spawn(cfg.bin, spawnArgs(cfg), {
       detached: true,
       stdio: ["ignore", fd, fd],
-    }).unref();
+      windowsHide: true,
+    });
+    state.spawnedPid = child.pid ?? undefined;
+    child.unref();
   }
 
   for (let i = 0; i < 16; i++) {
@@ -278,24 +412,77 @@ async function ensureDetour(cfg: DetourConfig): Promise<"already-running" | "sta
   return "start-failed";
 }
 
+/**
+ * Windows 上没有 pkill：用 netstat 找到监听该端口的 PID，再用 tasklist 确认它
+ * 确实是 detour，避免误杀别的进程。
+ */
+function findListeningPid(port: number): number | undefined {
+  try {
+    const netstat = spawnSync("netstat", ["-ano", "-p", "tcp"], {
+      encoding: "utf8",
+      timeout: 5000,
+      windowsHide: true,
+    });
+    for (const line of (netstat.stdout ?? "").split(/\r?\n/)) {
+      if (!line.includes("LISTENING")) continue;
+      const cols = line.trim().split(/\s+/);
+      if (!(cols[1] ?? "").endsWith(`:${port}`)) continue;
+      const pid = Number.parseInt(cols[cols.length - 1] ?? "", 10);
+      if (!Number.isInteger(pid) || pid <= 0) continue;
+      if (isDetourProcess(pid)) return pid;
+    }
+  } catch {
+    // netstat 不存在/unparseable：放弃精确匹配
+  }
+  return undefined;
+}
+
+function isDetourProcess(pid: number): boolean {
+  try {
+    const tasklist = spawnSync("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"], {
+      encoding: "utf8",
+      timeout: 5000,
+      windowsHide: true,
+    });
+    return /detour/i.test(tasklist.stdout ?? "");
+  } catch {
+    return false;
+  }
+}
+
 async function stopDetour(cfg: DetourConfig): Promise<string> {
   const { host, port } = parseHostPort(cfg.baseUrl);
   if (cfg.script) {
     spawn("bash", [cfg.script, "stop"], { detached: true, stdio: "ignore" }).unref();
-    for (let i = 0; i < 20; i++) {
-      await sleep(100);
-      if (!(await portOpen(host, port, 200))) return "stopped";
+  } else if (IS_WINDOWS) {
+    const pid = state.spawnedPid ?? findListeningPid(port);
+    if (pid) {
+      spawn("taskkill", ["/PID", String(pid), "/F", "/T"], { stdio: "ignore", windowsHide: true });
     }
-    return "still-running";
-  }
-  if (cfg.bin) {
+  } else if (cfg.bin) {
     spawn("pkill", ["-f", `detour -listen ${cfg.listen}`], { detached: true, stdio: "ignore" }).unref();
-    for (let i = 0; i < 20; i++) {
-      await sleep(100);
-      if (!(await portOpen(host, port, 200))) return "stopped";
+  }
+  for (let i = 0; i < 20; i++) {
+    await sleep(100);
+    if (!(await portOpen(host, port, 200))) {
+      state.spawnedPid = undefined;
+      return "stopped";
     }
   }
   return "still-running";
+}
+
+function configSourceText(cfg: DetourConfig): string {
+  const parts: string[] = [];
+  if (cfg.configFile) parts.push(`detour.json (${cfg.configFile})`);
+  const envKeys = Object.keys(cfg.overrides).map((key) => `DETOUR_${key.toUpperCase()}`);
+  if (envKeys.length) parts.push(`环境变量 ${envKeys.join(", ")}`);
+  return parts.length ? parts.join(" + ") : "内置默认值";
+}
+
+function overrideText(cfg: DetourConfig): string {
+  const args = spawnArgs(cfg);
+  return args.length ? `拉起时传参 ${args.join(" ")}` : "无（用 detour 自己的配置）";
 }
 
 function fmtConfig(cfg: DetourConfig): string {
@@ -303,13 +490,16 @@ function fmtConfig(cfg: DetourConfig): string {
     `本地地址   ${cfg.baseUrl}`,
     `上游       ${cfg.upstream}`,
     `代理       ${cfg.proxy}（只用于 detour 这一条链路）`,
+    `配置来源   ${configSourceText(cfg)}`,
+    `取值顺序   环境变量 > ~/.detour/detour.json（或 -config 指定）> 内置默认值`,
     `模式       ${cfg.mode}${cfg.mode === "auto" ? `（本次: ${state.directOk ? "直连" : "经 detour"}）` : ""}`,
     `自动拉起   ${cfg.autoStart ? "开" : "关 (PI_DETOUR_AUTO_START=0)"}`,
+    `拉起传参   ${overrideText(cfg)}`,
     `改写 provider ${rewriteTargets(cfg).join(", ")}（其余 provider 一律直连）`,
     `全局代理   ${globalProxyEnv() ?? "未设置（各 provider 按自身 baseUrl 直连）"}`,
     state.noProxyAdded ? `NO_PROXY 直连 ${state.noProxyAdded}` : "",
     cfg.directHosts.length ? `直连域名   ${cfg.directHosts.join(", ")}` : "",
-    `detour 二进制 ${cfg.bin ? cfg.bin : "(未找到)"}`,
+    `detour 二进制 ${cfg.bin ? cfg.bin : "(未找到，用 DETOUR_BIN=/path/to/detour 指定)"}`,
     cfg.script ? `管理脚本   ${cfg.script}` : "",
   ].filter(Boolean).join("\n");
 }
@@ -379,14 +569,14 @@ export default async function (pi: ExtensionAPI) {
           ctx.ui.notify(
             probe.ok
               ? `opencode.ai 直连不可用，已走 detour 转发 (${current.baseUrl})${probe.status ? `，链路探测 HTTP ${probe.status}` : ""}`
-              : `detour 端口已开，但链路异常: ${probe.error ?? `HTTP ${probe.status}`} — 检查梯子/代理规则`,
+              : `detour 端口已开，但链路异常: ${probe.error ?? `HTTP ${probe.status}`} — 梯子/代理规则有问题（具体看上面这句错误）`,
             probe.ok ? "info" : "warning",
           );
         }
       } else if (result === "no-binary") {
         if (ctx.hasUI) {
           ctx.ui.notify(
-            "未找到 detour 二进制。设置 DETOUR_BIN=/path/to/detour，或用 detour.sh 手动启动。",
+            "未找到 detour 二进制。设置 DETOUR_BIN=/path/to/detour（Windows 上是 detour.exe），或用 detour.sh 手动启动。",
             "warning",
           );
         }
@@ -427,6 +617,8 @@ export default async function (pi: ExtensionAPI) {
             `改写 provider: ${rewriteTargets(current).join(", ")}（其余直连）`,
             `上游: ${current.upstream}`,
             `代理: ${current.proxy}（仅 detour 链路）`,
+            `配置来源: ${configSourceText(current)}`,
+            `拉起传参: ${overrideText(current)}`,
             `全局代理: ${globalProxyEnv() ?? "未设置（qwen 等 provider 直连）"}`,
             state.noProxyAdded ? `NO_PROXY 直连: ${state.noProxyAdded}` : "",
             current.bin ? `二进制: ${current.bin}` : "二进制: 未找到（DETOUR_BIN 或 detour.sh）",

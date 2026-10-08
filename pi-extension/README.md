@@ -87,14 +87,33 @@ baseUrl）。所以：
 | `DETOUR_LISTEN` | `127.0.0.1:8787` | 兼容 detour.sh 的 host:port 写法，二选一 |
 | `DETOUR_UPSTREAM` | `https://opencode.ai/zen/go/v1/` | 实际上游（换供应商时改，如 `https://api.openai.com/v1`） |
 | `DETOUR_PROXY` | `http://127.0.0.1:7897` | 梯子代理，支持 `socks5://`，`direct` 直连 |
+| `DETOUR_CONFIG` | — | 指定 `detour.json` 路径（不设则用二进制旁的 detour.json） |
 | `DETOUR_BIN` | 自动查找 | detour 二进制路径 |
 | `DETOUR_EXTRA_PROVIDERS` | 空 | 逗号分隔的额外 provider 名，同样改写 baseUrl 到本地（需自行把 DETOUR_UPSTREAM 配成对应 API） |
 | `DETOUR_DIRECT_HOSTS` | 空 | 逗号分隔域名。存在全局代理时写入 `NO_PROXY` 强制直连，例如 `token-plan.cn-beijing.maas.aliyuncs.com` |
 | `PI_DETOUR_AUTO_START` | 开 | 设为 `0` 关闭自动拉起 |
 
+### 配置从哪来（三个层级）
+
+插件用 `detour -print-config` 问二进制它最终生效的配置，取值顺序：
+
+1. 你显式设置的环境变量（`DETOUR_LISTEN` / `DETOUR_UPSTREAM` / `DETOUR_PROXY` / `DETOUR_CONFIG`）；
+2. 配置文件，按顺序找第一个存在的：`$DETOUR_CONFIG` → `~/.detour/detour.json`
+   （Windows：`%USERPROFILE%\.detour\detour.json`）→ 二进制同目录 → 当前目录；
+3. 内置默认值。
+
+只有**显式设置**的环境变量才会作为命令行参数传给它拉起的 detour 进程，所以插件不会
+拿自己的默认 `7897` 去盖掉你写好的 `detour.json`。`/detour env` 会显示生效值、来源、
+以及拉起时会传的参数。
+
 detour 二进制查找顺序：`DETOUR_BIN` → 插件同级 `../detour`（仓库布局）→
-`~/self-git/detour/detour` → `PATH`。找到同目录 `detour.sh` 时优先用它
-管理（pidfile/日志），否则直接 spawn 二进制并写 `detour.log`。
+`~/self-git/detour/detour` → `PATH`（Windows 上自动补 `.exe`）。
+
+- **Unix**：找到同目录 `detour.sh` 时优先用它管理（pidfile/日志），否则直接 spawn
+  二进制并写 `detour.log`；停止用 `pkill` 或脚本。
+- **Windows**：没有 bash/`nohup`/`pkill`，插件直接 spawn `detour.exe`（参数同上），
+  停止用 `taskkill`（先杀自己拉起的 PID，否则从 `netstat -ano` 找到监听端口且进程名
+  含 detour 的那个 PID，不会误杀别的进程）。
 
 ## 原理
 
@@ -121,6 +140,11 @@ detour 二进制查找顺序：`DETOUR_BIN` → 插件同级 `../detour`（仓�
   或手动 `detour.sh start` 后 `/detour status` 确认。
 - **模型列表里没有 opencode-go**：没配 key。`export OPENCODE_API_KEY`
   或 `/login opencode-go`。
+- **链路不通报“连不上代理”**：502 的响应体里带 detour 自己的错误，例如
+  `dial tcp 127.0.0.1:7897: connection refused (proxy http://127.0.0.1:7897: ...)`——
+  意思是 detour 连不上梯子，不是 pi 连不上 detour。用 `/detour env` 看生效代理端口，
+  对不上就改 `DETOUR_PROXY` 或在 `detour.json` 里改 `proxy`（Windows 上常见：梯子
+  在 7890，detour 却用内置默认 7897）。
 
 ## 测试
 
