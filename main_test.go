@@ -614,3 +614,78 @@ func TestProxyHintNamesTheProxy(t *testing.T) {
 		t.Error("proxyHint should mention direct mode")
 	}
 }
+
+// --- config file encodings (Windows tooling) ---------------------------------
+
+func writeConfigBytes(t *testing.T, data []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "detour.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// utf16Bytes encodes body the way PowerShell's ">" / Out-File / Notepad "Unicode" do.
+func utf16Bytes(body string, order binary.ByteOrder, bom []byte) []byte {
+	out := append([]byte{}, bom...)
+	for _, r := range body {
+		var b [2]byte
+		order.PutUint16(b[:], uint16(r))
+		out = append(out, b[:]...)
+	}
+	return out
+}
+
+func TestConfigFileEncodings(t *testing.T) {
+	const body = `{"listen":"127.0.0.1:18888","proxy":"http://127.0.0.1:7890"}`
+	cases := []struct {
+		name string
+		data []byte
+	}{
+		{"utf8", []byte(body)},
+		{"utf8-crlf", []byte(`{"listen":"127.0.0.1:18888",` + "\r\n" + `"proxy":"http://127.0.0.1:7890"}`)},
+		{"utf8-bom", append([]byte{0xEF, 0xBB, 0xBF}, body...)}, // PowerShell: Set-Content -Encoding UTF8
+		{"utf16le-bom", utf16Bytes(body, binary.LittleEndian, []byte{0xFF, 0xFE})},
+		{"utf16be-bom", utf16Bytes(body, binary.BigEndian, []byte{0xFE, 0xFF})},
+		{"utf16le-nobom", utf16Bytes(body, binary.LittleEndian, nil)},
+		{"utf16be-nobom", utf16Bytes(body, binary.BigEndian, nil)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := loadConfig(writeConfigBytes(t, tc.data), fakeEnv(nil))
+			if err != nil {
+				t.Fatalf("loadConfig: %v", err)
+			}
+			if cfg.Listen != "127.0.0.1:18888" || cfg.Proxy != "http://127.0.0.1:7890" {
+				t.Fatalf("got %+v, want the values from the file", cfg)
+			}
+		})
+	}
+}
+
+func TestConfigFileNonUTF8GetsAHint(t *testing.T) {
+	// GBK bytes inside a JSON string: not valid UTF-8, so json.Unmarshal fails.
+	data := []byte(`{"upstream":"https://example.com/?q=` + "\xd6\xd0\xce\xc4" + `"}`)
+	_, err := loadConfig(writeConfigBytes(t, data), fakeEnv(nil))
+	if err == nil {
+		t.Fatal("want a parse error for a non-UTF-8 config file")
+	}
+	if !strings.Contains(err.Error(), "UTF-8") {
+		t.Fatalf("error = %q, want the UTF-8 hint", err)
+	}
+}
+
+func TestEnvValuesMayBeQuoted(t *testing.T) {
+	cfg, err := loadConfig("", fakeEnv(map[string]string{
+		envListen:   ` "127.0.0.1:9999" `,
+		envProxy:    `"http://127.0.0.1:7890"`, // cmd: set DETOUR_PROXY="..." keeps the quotes
+		envUpstream: `  "https://env.example/v1"  `,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Listen != "127.0.0.1:9999" || cfg.Proxy != "http://127.0.0.1:7890" || cfg.Upstream != "https://env.example/v1" {
+		t.Fatalf("got %+v, want quotes and spaces stripped", cfg)
+	}
+}

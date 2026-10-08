@@ -141,6 +141,10 @@ mkdir -p ~/.detour && cp detour.example.json ~/.detour/detour.json
 
 > ⚠️ `detour.json` 已被 `.gitignore` 忽略；里面可能含代理认证信息，
 > 别改个名字提交到仓库。
+>
+> 📄 文件编码：UTF-8 最好；**0.4.1 起也兼容 UTF-8 BOM 与 UTF-16**（PowerShell 5.1 的
+> `> 文件`、`Out-File`、`Set-Content -Encoding UTF8` 以及记事本"Unicode"存出来的
+> 都能读）。GBK/ANSI 保存的会明确报错，提示另存为 UTF-8。
 
 ### 方式三：命令行参数（临时/测试用）
 
@@ -174,7 +178,11 @@ detour.exe
 
 `detour.exe` 按 `%USERPROFILE%\.detour\detour.json` → exe 同目录 → 当前目录的顺序找配置；
 没有配置文件时用内置默认值，所以临时改端口只要
-`set DETOUR_PROXY=http://127.0.0.1:7890` 再启动即可。
+`set DETOUR_PROXY=http://127.0.0.1:7890` 再启动即可（加引号也行，会自动去掉）。
+
+配置文件编码不用操心：UTF-8、UTF-8 BOM、UTF-16（记事本"Unicode"、PowerShell 的
+`>` / `Out-File` / `Set-Content -Encoding UTF8` 产物）都能读；GBK 保存的会报错并
+提示另存为 UTF-8（否则中文会变乱码）。
 
 ### 配置项一览
 

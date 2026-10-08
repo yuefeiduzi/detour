@@ -129,6 +129,12 @@ test("DETOUR_BASE_URL 优先级最高，且去掉结尾斜杠", async () => {
   expect(registered[0].config).toEqual({ baseUrl: "http://127.0.0.1:9998" });
 });
 
+test("环境变量带引号也能用（Windows 的 set VAR=\"…\" 习惯）", async () => {
+  process.env.DETOUR_LISTEN = ' "127.0.0.1:9777" ';
+  const { registered } = await loadExtension();
+  expect(registered[0].config).toEqual({ baseUrl: "http://127.0.0.1:9777" });
+});
+
 test("DETOUR_BIN 指向不存在的路径时不影响加载（退回默认）", async () => {
   process.env.DETOUR_BIN = "/nonexistent/detour";
   const { registered } = await loadExtension();

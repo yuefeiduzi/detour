@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -19,9 +21,11 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf16"
+	"unicode/utf8"
 )
 
-const version = "0.4.0"
+const version = "0.4.1"
 
 const (
 	defaultListen     = "127.0.0.1:8787"
@@ -65,15 +69,21 @@ func (c *Config) applyDefaults() {
 // applyEnv overlays DETOUR_* environment variables onto cfg. Empty values are
 // ignored so that "unset" and "empty" behave the same.
 func applyEnv(cfg *Config, getenv func(string) string) {
-	if v := strings.TrimSpace(getenv(envListen)); v != "" {
+	if v := envValue(getenv, envListen); v != "" {
 		cfg.Listen = v
 	}
-	if v := strings.TrimSpace(getenv(envUpstream)); v != "" {
+	if v := envValue(getenv, envUpstream); v != "" {
 		cfg.Upstream = v
 	}
-	if v := strings.TrimSpace(getenv(envProxy)); v != "" {
+	if v := envValue(getenv, envProxy); v != "" {
 		cfg.Proxy = v
 	}
+}
+
+// envValue reads an environment variable, dropping surrounding whitespace and
+// the quotes Windows users habitually add (cmd keeps them: set DETOUR_PROXY="x").
+func envValue(getenv func(string) string, key string) string {
+	return strings.Trim(strings.TrimSpace(getenv(key)), `"`)
 }
 
 // defaultConfigPath is the canonical per-user location for detour.json:
@@ -110,6 +120,69 @@ func discoverConfig() string {
 	return ""
 }
 
+// readConfigFile reads a config file and normalizes its encoding. Windows
+// tooling happily writes UTF-8 with a BOM (PowerShell 5.1: Set-Content
+// -Encoding UTF8) or UTF-16 (PowerShell 5.1: "... > config.json", Out-File,
+// Notepad "Unicode"), and encoding/json accepts neither.
+func readConfigFile(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return decodeConfig(data), nil
+}
+
+func decodeConfig(data []byte) []byte {
+	switch {
+	case bytes.HasPrefix(data, []byte{0xEF, 0xBB, 0xBF}): // UTF-8 BOM
+		return data[3:]
+	case bytes.HasPrefix(data, []byte{0xFF, 0xFE}): // UTF-16LE BOM
+		return utf16ToUTF8(data[2:], binary.LittleEndian)
+	case bytes.HasPrefix(data, []byte{0xFE, 0xFF}): // UTF-16BE BOM
+		return utf16ToUTF8(data[2:], binary.BigEndian)
+	}
+	if order := detectUTF16(data); order != nil {
+		return utf16ToUTF8(data, order) // UTF-16 without BOM
+	}
+	return data
+}
+
+// detectUTF16 guesses the byte order of BOM-less UTF-16. ASCII JSON in UTF-16 is
+// half NUL bytes — little-endian puts them at odd offsets, big-endian at even
+// ones — while UTF-8 JSON never contains NUL. Returns nil for non-UTF-16 data.
+func detectUTF16(data []byte) binary.ByteOrder {
+	limit := min(len(data), 512)
+	if limit < 8 {
+		return nil
+	}
+	var even, odd int
+	for i := 0; i < limit; i++ {
+		if data[i] != 0 {
+			continue
+		}
+		if i%2 == 0 {
+			even++
+		} else {
+			odd++
+		}
+	}
+	if even+odd == 0 {
+		return nil
+	}
+	if odd >= even {
+		return binary.LittleEndian
+	}
+	return binary.BigEndian
+}
+
+func utf16ToUTF8(b []byte, order binary.ByteOrder) []byte {
+	units := make([]uint16, 0, len(b)/2)
+	for i := 0; i+1 < len(b); i += 2 {
+		units = append(units, order.Uint16(b[i:i+2]))
+	}
+	return []byte(string(utf16.Decode(units)))
+}
+
 // loadConfig builds the effective configuration.
 // Precedence, low to high: built-in defaults < DETOUR_* env vars < config file
 // < command-line flags (applied by parseFlags).
@@ -120,9 +193,14 @@ func loadConfig(path string, getenv func(string) string) (*Config, error) {
 	if path == "" {
 		return cfg, nil
 	}
-	data, err := os.ReadFile(path)
+	data, err := readConfigFile(path)
 	if err != nil {
 		return nil, err
+	}
+	// encoding/json silently replaces invalid UTF-8 with U+FFFD, which would turn
+	// a GBK-saved file into mojibake instead of an error. Fail loudly instead.
+	if !utf8.Valid(data) {
+		return nil, fmt.Errorf("%s is not valid UTF-8 — re-save it as UTF-8 (Notepad / VS Code, or PowerShell `Set-Content -Encoding utf8`)", path)
 	}
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
@@ -210,7 +288,7 @@ Usage of detour:
 
 	resolvedPath := *configPath
 	if resolvedPath == "" {
-		resolvedPath = strings.TrimSpace(os.Getenv(envConfig))
+		resolvedPath = strings.TrimSpace(envValue(os.Getenv, envConfig))
 	}
 	if resolvedPath == "" {
 		resolvedPath = discoverConfig()

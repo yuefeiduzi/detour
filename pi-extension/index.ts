@@ -99,12 +99,22 @@ interface RuntimeState {
 
 const state: RuntimeState = { directOk: true, mode: "auto" };
 
+/**
+ * 读环境变量：去掉首尾空白，以及 Windows 上习惯性加的引号
+ * （cmd 的 `set DETOUR_PROXY="http://127.0.0.1:7890"` 会把引号一起存进去）。
+ */
+function envValue(name: string): string | undefined {
+  const raw = process.env[name]?.trim();
+  if (!raw) return undefined;
+  const unquoted = raw.replace(/^"(.*)"$/s, "$1").trim();
+  return unquoted || undefined;
+}
+
 /** baseUrl 优先看 DETOUR_BASE_URL，其次 DETOUR_LISTEN / detour 实际监听的地址。 */
 function resolveBaseUrl(effective?: EffectiveConfig): string {
-  const env = process.env;
-  const explicit = env.DETOUR_BASE_URL?.trim();
+  const explicit = envValue("DETOUR_BASE_URL");
   if (explicit) return explicit.replace(/\/+$/, "");
-  const listen = env.DETOUR_LISTEN?.trim() || effective?.listen;
+  const listen = envValue("DETOUR_LISTEN") || effective?.listen;
   if (listen) return `http://${listen.replace(/^https?:\/\//, "")}`;
   return DEFAULT_BASE_URL;
 }
@@ -139,7 +149,7 @@ function existingFile(candidates: string[]): string | undefined {
 }
 
 function resolveMode(): DetourMode {
-  const m = process.env.DETOUR_MODE?.trim().toLowerCase();
+  const m = envValue("DETOUR_MODE")?.toLowerCase();
   if (m === "always" || m === "never") return m;
   return "auto";
 }
@@ -206,8 +216,9 @@ function rewriteTargets(cfg: DetourConfig): string[] {
 function findDetour(): { bin: string; script?: string } | undefined {
   const env = process.env;
   const candidates: string[] = [];
-  if (env.DETOUR_BIN?.trim()) {
-    const hint = env.DETOUR_BIN.trim();
+  const binHint = envValue("DETOUR_BIN");
+  if (binHint) {
+    const hint = binHint;
     if (looksLikePath(hint)) candidates.push(hint);
     else candidates.push(whichSync(hint) ?? "");
   }
@@ -260,16 +271,16 @@ function loadConfig(): DetourConfig {
   const effective = found ? readEffectiveConfig(found.bin) : undefined;
   const baseUrl = resolveBaseUrl(effective);
 
-  const explicitListen = env.DETOUR_LISTEN?.trim();
-  const explicitUpstream = env.DETOUR_UPSTREAM?.trim();
-  const explicitProxy = env.DETOUR_PROXY?.trim();
-  const explicitConfig = env.DETOUR_CONFIG?.trim();
+  const explicitListen = envValue("DETOUR_LISTEN");
+  const explicitUpstream = envValue("DETOUR_UPSTREAM");
+  const explicitProxy = envValue("DETOUR_PROXY");
+  const explicitConfig = envValue("DETOUR_CONFIG");
 
   // 只有显式设置的环境变量才传命令行参数，避免用插件的默认值覆盖用户的 detour.json。
   const overrides: DetourOverrides = {};
   if (explicitConfig) overrides.config = explicitConfig;
   if (explicitListen) overrides.listen = explicitListen;
-  else if (env.DETOUR_BASE_URL?.trim()) overrides.listen = listenFromBaseUrl(baseUrl);
+  else if (envValue("DETOUR_BASE_URL")) overrides.listen = listenFromBaseUrl(baseUrl);
   if (explicitUpstream) overrides.upstream = explicitUpstream;
   if (explicitProxy) overrides.proxy = explicitProxy;
 
@@ -280,9 +291,9 @@ function loadConfig(): DetourConfig {
     proxy: explicitProxy || effective?.proxy || DEFAULT_PROXY,
     mode: resolveMode(),
     autoStart: env.PI_DETOUR_AUTO_START !== "0",
-    extraProviders: (env.DETOUR_EXTRA_PROVIDERS ?? "")
+    extraProviders: (envValue("DETOUR_EXTRA_PROVIDERS") ?? "")
       .split(",").map((s) => s.trim()).filter(Boolean),
-    directHosts: (env.DETOUR_DIRECT_HOSTS ?? "")
+    directHosts: (envValue("DETOUR_DIRECT_HOSTS") ?? "")
       .split(",").map((s) => s.trim()).filter(Boolean),
     overrides,
     bin: found?.bin,
