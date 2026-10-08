@@ -1,0 +1,173 @@
+name: Release
+
+# 推一个 `v*` tag 就是唯一的发布触发条件：version job 在 tag 与 main.go /
+# package.json 的版本不一致时直接失败，所以不可能出现"制品自称 0.4.1、tag 是
+# v0.4.2"。
+#
+# workflow_dispatch 跑同样的门槛与同样的构建，但只上传 Actions 制品、不创建
+# Release —— 首次打 tag 之前，用它把整条链路先演练一遍。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 不要取消可能正在发布的运行：重跑便宜，上传一半的资产不便宜。
+# `-publish` 后缀不是装饰：下面的 tests job 通过 workflow_call 调 ci.yml，
+# 而在被调用的 workflow 里 `github.workflow` 是**调用方**的名字（这里即
+# `Release-<ref>`）。concurrency group 比较时不区分大小写，ci.yml 又是
+# `cancel-in-progress: true`，所以不带后缀的 `release-<ref>` 会让本运行在
+# 被调用方一启动时把自己取消掉。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-publish
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    # main 已经拿到的门槛，对着正在打 tag 的那个提交再跑一遍。
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  version:
+    name: 版本号校验
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: main.go 与 package.json 必须一致，且与 tag 相同
+        id: read
+        run: |
+          set -euo pipefail
+
+          # 版本号只有两处：main.go 的 `const version`（`detour -version` 的输出）
+          # 与 package.json（pi 包 / npm 侧）。不一致就会出现"制品自称 0.4.1、
+          # tag 却是 v0.4.2"这种没法回滚的发布事故，所以在花 runner 编译之前先失败。
+          go_ver="$(sed -n 's/^const version = "\(.*\)"$/\1/p' main.go)"
+          pkg_ver="$(sed -n 's/.*"version": "\([^"]*\)".*/\1/p' package.json | head -n1)"
+
+          echo "main.go:      $go_ver"
+          echo "package.json: $pkg_ver"
+
+          failed=0
+          report() { echo "::error::$1"; failed=1; }
+          [ -n "$go_ver" ]  || report "没能从 main.go 里读到 const version"
+          [ -n "$pkg_ver" ] || report "没能从 package.json 里读到 version"
+          [ "$go_ver" = "$pkg_ver" ] || report "main.go ($go_ver) 与 package.json ($pkg_ver) 不一致"
+
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            echo "tag:          $GITHUB_REF_NAME"
+            [ "v$go_ver" = "$GITHUB_REF_NAME" ] || report "tag $GITHUB_REF_NAME 与版本 v$go_ver 不一致"
+          fi
+
+          [ "$failed" = 0 ] || { echo "两处版本都改好，再重新打 tag。"; exit 1; }
+          echo "version=$go_ver" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: [tests, version]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: windows, goarch: amd64, ext: ".exe", archive: zip }
+          - { goos: darwin,  goarch: arm64, ext: "",     archive: tar.gz }
+          - { goos: darwin,  goarch: amd64, ext: "",     archive: tar.gz }
+    env:
+      # 纯标准库，交叉编译不需要 C 工具链，产物是单文件静态二进制。
+      CGO_ENABLED: "0"
+      NAME: detour-${{ needs.version.outputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 一个扁平目录：解压出来就是普通文件名（`./detour` 或 `detour.exe`），
+      # zip/tar 与 Release 资产的名字保持一致。
+      - name: 编译 + 打包
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          # staging/ 与 dist/ 都在 .gitignore 里，本地跑这套命令也不会脏工作区。
+          mkdir -p staging dist
+          go build -trimpath -ldflags "-s -w" -o "staging/detour${{ matrix.ext }}" .
+          cp detour.example.json README.md staging/
+          if [ "${{ matrix.goos }}" = windows ]; then
+            # 文件名显式列出：解压出来就是 detour.exe，没有多余的 ./ 前缀目录。
+            (cd staging && zip -q -X "../dist/$NAME.zip" "detour${{ matrix.ext }}" detour.example.json README.md)
+          else
+            # macOS 多带一个 detour.sh（启动/停止/体检），tar 会保住可执行位。
+            cp detour.sh staging/
+            chmod +x staging/detour staging/detour.sh
+            (cd staging && tar czf "../dist/$NAME.tar.gz" detour detour.sh detour.example.json README.md)
+          fi
+          ls -l "dist/$NAME."*
+
+      # dispatch 演练用：不创建 Release，但能从 Actions 页面下载整套制品。
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.NAME }}
+          path: ${{ env.NAME }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  publish:
+    name: 创建草稿 Release
+    needs: [version, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 校验和
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum detour-*.tar.gz detour-*.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 创建草稿 Release（检查完再 Publish）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # 先建草稿：资产、正文都检查过再点 Publish —— 草稿对其他人不可见，
+          # 发现不对直接删掉重打 tag，不会留下一个半成品 release。
+          gh release create "$TAG" \
+            --verify-tag \
+            --draft \
+            --title "detour $VERSION" \
+            --generate-notes \
+            dist/*
+
+          # --generate-notes 生成的更新日志已经在正文里，把它取回来、
+          # 前面接上 packaging/release-header.md 的安装说明，两样都不丢。
+          gh release view "$TAG" --json body -q .body > auto-notes.md
+          cat packaging/release-header.md > release-body.md
+          printf '\n---\n\n' >> release-body.md
+          cat auto-notes.md >> release-body.md
+          gh release edit "$TAG" --notes-file release-body.md
+
+          {
+            echo "### 草稿已就绪"
+            echo ""
+            echo "- 检查资产与正文：https://github.com/$GITHUB_REPOSITORY/releases"
+            echo "- 确认无误后在页面上点 Publish release（在 Publish 之前别人看不到）"
+          } >> "$GITHUB_STEP_SUMMARY"

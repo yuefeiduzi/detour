@@ -3,3 +3,7 @@
 .DS_Store
 detour.log
 .detour.pid
+
+# 本地跑 packaging 命令时的中间产物（CI 里同名）
+staging/
+dist/

@@ -23,7 +23,7 @@ cp pi-extension/index.ts ~/.pi/agent/extensions/detour.ts
 **方式二：作为 pi 包安装（整个 detour 仓库）**
 
 ```bash
-pi install git:github.com/ross/detour
+pi install git:github.com/yuefeiduzi/detour
 # 或本地路径: pi install /path/to/detour
 ```
 

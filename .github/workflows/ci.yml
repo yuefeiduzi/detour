@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # release.yml 通过 workflow_call 调本文件当发布门槛：
+  # 打 tag 时对着**正在打 tag 的那个提交**再跑一遍，所以"main 上绿"始终等于
+  # "可以打 tag"，不会出现 CI 本来就红、却仍然发出制品的情况。
+  workflow_call:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go（fmt + vet + test）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::以下文件没格式化，先跑 gofmt -w："
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./...
+
+      # 管理脚本是 bash 写的（Windows 用户不用它，但仍要保证质量）。
+      # shellcheck 在 ubuntu-latest 的镜像里自带。
+      - name: shellcheck（detour.sh）
+        run: shellcheck detour.sh
+
+  pi-extension:
+    name: pi 插件（bun test）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: bun test
+        run: bun test pi-extension
+
+  cross-build:
+    name: 交叉编译发布目标
+    runs-on: ubuntu-latest
+    env:
+      # 纯标准库 + CGO_ENABLED=0：Linux runner 上就能编出 Windows/macOS 的
+      # 单文件静态二进制，不需要 macos runner。
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 不产出制品，只保证 release.yml 的三个目标在打 tag 之前就能编译过。
+      - name: windows/amd64 + darwin/arm64 + darwin/amd64
+        run: |
+          set -euo pipefail
+          for target in windows/amd64 darwin/arm64 darwin/amd64; do
+            goos="${target%%/*}"
+            goarch="${target##*/}"
+            echo "==> $goos/$goarch"
+            GOOS="$goos" GOARCH="$goarch" go build -trimpath -o /dev/null .
+          done

@@ -1,5 +1,8 @@
 # detour — 本地模型 API 转发小工具
 
+[![CI](https://github.com/yuefeiduzi/detour/actions/workflows/ci.yml/badge.svg)](https://github.com/yuefeiduzi/detour/actions/workflows/ci.yml)
+[![Release](https://github.com/yuefeiduzi/detour/actions/workflows/release.yml/badge.svg)](https://github.com/yuefeiduzi/detour/actions/workflows/release.yml)
+
 公司网络封了模型 API（opencode / pi 直连不通），又不想一直开梯子全局模式。
 detour 是一个跑在本地的小型转发服务：把模型客户端的地址指到本地，
 detour 收到请求后通过本地梯子转发到真实 API。梯子保持规则模式即可，
@@ -34,6 +37,21 @@ pi / opencode ──http://127.0.0.1:8787──▶ detour ──梯子(127.0.0.1
 ---
 
 ## 一、构建与启动
+
+### 0. 直接下载（不想装 Go 的话）
+
+[GitHub Releases](../../releases) 上有 CI 构建好的制品（同一套命令，见
+[.github/workflows/release.yml](.github/workflows/release.yml)）：
+
+| 平台 | 资产 |
+|---|---|
+| Windows x64 | `detour-<版本>-windows-amd64.zip`（解压即得 `detour.exe`） |
+| macOS Apple Silicon | `detour-<版本>-darwin-arm64.tar.gz` |
+| macOS Intel | `detour-<版本>-darwin-amd64.tar.gz` |
+
+macOS 解压后 `./detour -print-config` 看生效配置；Windows 直接在 cmd 里
+`detour.exe -check`。二进制没签名：macOS 被 Gatekeeper 拦下就
+`xattr -d com.apple.quarantine ./detour`，Windows SmartScreen 选“仍要运行”。
 
 ### 1. 构建二进制（可选，已有二进制可跳过）
 
@@ -213,7 +231,7 @@ detour.exe
 cp pi-extension/index.ts ~/.pi/agent/extensions/detour.ts
 
 # 方式二：作为 pi 包安装（以后更新仓库自动同步）
-pi install git:github.com/ross/detour
+pi install git:github.com/yuefeiduzi/detour
 ```
 
 ### 2. 配置密钥
