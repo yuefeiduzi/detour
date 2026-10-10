@@ -435,6 +435,47 @@ func TestStreaming(t *testing.T) {
 	}
 }
 
+func TestLogLineSplitsUploadAndTTFB(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(io.Discard) })
+
+	upstream := startTLSUpstream(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)        // consume the upload first ...
+		time.Sleep(120 * time.Millisecond) // ... then take a while to start responding
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "ok")
+	}))
+	proxy := startFakeProxy(t)
+	relay := startRelay(t, Config{Upstream: upstream.URL, Proxy: proxy})
+
+	req, err := http.NewRequest(http.MethodPost, relay+"/chat/completions", strings.NewReader(strings.Repeat("x", 4096)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	var line string
+	for _, l := range strings.Split(buf.String(), "\n") {
+		if strings.Contains(l, "/chat/completions") {
+			line = l
+		}
+	}
+	if line == "" {
+		t.Fatalf("no log line for the request, got: %q", buf.String())
+	}
+	for _, want := range []string{"ttfb ", "req 4.0 KB in ", "resp 2 B"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("log line %q is missing %q", line, want)
+		}
+	}
+}
+
 func TestBadProxyScheme(t *testing.T) {
 	if _, err := buildTransport(&Config{Proxy: "quic://127.0.0.1:7897"}); err == nil {
 		t.Fatal("expected error for unsupported proxy scheme")

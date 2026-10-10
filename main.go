@@ -18,6 +18,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -431,7 +432,11 @@ func newRelay(cfg *Config, tr *http.Transport) (http.Handler, error) {
 	return logMiddleware(rp, upstream, prefix, cfg.Verbose), nil
 }
 
-// logMiddleware logs each request after completion and captures status/bytes.
+// logMiddleware logs each request after completion and captures status/bytes,
+// time-to-first-byte and how long the client spent uploading its body. Without
+// those split numbers a slow turn is impossible to attribute: the whole
+// conversation is re-sent on every request, so "slow" can mean the upload
+// (proxy uplink), the upstream's prefill, or slow token generation.
 func logMiddleware(next http.Handler, upstream *url.URL, prefix string, verbose bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if verbose {
@@ -439,6 +444,11 @@ func logMiddleware(next http.Handler, upstream *url.URL, prefix string, verbose 
 			logHeaders("req", r.Header)
 		}
 		start := time.Now()
+		var body *bodyCounter
+		if r.Body != nil {
+			body = &bodyCounter{rc: r.Body}
+			r.Body = body
+		}
 		lw := &loggingWriter{ResponseWriter: w}
 		next.ServeHTTP(lw, r)
 
@@ -450,10 +460,55 @@ func logMiddleware(next http.Handler, upstream *url.URL, prefix string, verbose 
 		if status == 0 {
 			status = http.StatusOK
 		}
-		log.Printf("%s %s -> %s | %d | %s | %s",
-			r.Method, r.URL.RequestURI(), fwd.String(), status,
-			time.Since(start).Round(time.Millisecond), humanBytes(lw.bytes))
+		fields := []string{
+			fmt.Sprintf("%s %s -> %s", r.Method, r.URL.RequestURI(), fwd.String()),
+			strconv.Itoa(status),
+			humanDuration(time.Since(start)),
+			"ttfb " + humanDuration(lw.ttfb(start)),
+		}
+		if body != nil && body.n > 0 {
+			upload := "req " + humanBytes(body.n)
+			if !body.done.IsZero() {
+				upload += " in " + humanDuration(body.done.Sub(start))
+			}
+			fields = append(fields, upload)
+		}
+		fields = append(fields, "resp "+humanBytes(lw.bytes))
+		log.Print(strings.Join(fields, " | "))
 	})
+}
+
+// bodyCounter counts how many request-body bytes the client uploaded and when
+// the upload finished. ReverseProxy streams the body straight through, so a
+// stalled uplink shows up here as a large "in" duration.
+type bodyCounter struct {
+	rc   io.ReadCloser
+	n    int64
+	done time.Time
+}
+
+func (b *bodyCounter) Read(p []byte) (int, error) {
+	n, err := b.rc.Read(p)
+	b.n += int64(n)
+	if err != nil && b.done.IsZero() {
+		b.done = time.Now()
+	}
+	return n, err
+}
+
+func (b *bodyCounter) Close() error { return b.rc.Close() }
+
+// humanDuration formats a duration for the log line; a missing measurement is
+// rendered as "-" instead of a bogus zero.
+func humanDuration(d time.Duration) string {
+	if d <= 0 {
+		return "-"
+	}
+	rounded := d.Round(time.Millisecond)
+	if rounded == 0 {
+		return "<1ms"
+	}
+	return rounded.String()
 }
 
 func logHeaders(prefix string, h http.Header) {
@@ -478,17 +533,22 @@ func humanBytes(n int64) string {
 	}
 }
 
-// loggingWriter captures the response status and byte count while keeping
-// streaming (Flush) and upgrade (Hijack) support intact.
+// loggingWriter captures the response status, byte count and the moment the
+// first response byte went out, while keeping streaming (Flush) and upgrade
+// (Hijack) support intact.
 type loggingWriter struct {
 	http.ResponseWriter
 	status int
 	bytes  int64
+	first  time.Time
 }
 
 func (w *loggingWriter) WriteHeader(code int) {
-	if w.status == 0 {
+	// 1xx (100 Continue, 103 Early Hints) is not the response yet: the upstream
+	// headers are still to come, so they must not stop the TTFB clock short.
+	if w.status == 0 && code >= 200 {
 		w.status = code
+		w.first = time.Now()
 	}
 	w.ResponseWriter.WriteHeader(code)
 }
@@ -497,9 +557,20 @@ func (w *loggingWriter) Write(b []byte) (int, error) {
 	if w.status == 0 {
 		w.status = http.StatusOK
 	}
+	if w.first.IsZero() {
+		w.first = time.Now()
+	}
 	n, err := w.ResponseWriter.Write(b)
 	w.bytes += int64(n)
 	return n, err
+}
+
+// ttfb reports how long after start the first response byte was written.
+func (w *loggingWriter) ttfb(start time.Time) time.Duration {
+	if w.first.IsZero() {
+		return 0
+	}
+	return w.first.Sub(start)
 }
 
 func (w *loggingWriter) Flush() {

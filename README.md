@@ -390,6 +390,17 @@ minimax-m3 等），直接开聊。
   如果它也被墙，给 models.dev 单独配代理规则即可。
 - **梯子规则模式**：确保 `opencode.ai`、`api.openai.com` 等域名命中代理规则；
   或在 Clash 里把这些域名加进代理组。detour 的意义就是让你不用开全局。
+- **觉得慢？先看日志里三个数**（每一行请求结束后都会打印）：
+  ```
+  POST /chat/completions -> https://opencode.ai/zen/go/v1/chat/completions | 200 | 12.305s | ttfb 4.51s | req 956.4 KB in 2.06s | resp 1.6 MB
+  ```
+  - `req ... in ...`：客户端把请求体传完用了多久（**上传**）。pi 每一轮都会把整个会话
+    重发一次，图片以 base64 内联，所以长会话 / 多截图时这里会很大 —— 这一段慢说明
+    梯子上行不行，换节点或减少图片（`/compact`、给模型配 `inputLimits.images.resize`）。
+  - `ttfb`：从收到请求到上游第一个字节（含上面的上传时间 + 上游排队/prefill）。
+    `ttfb` 远大于 `req` 时，慢在上游排队/预填充，不在本地链路。
+  - 总耗时 − `ttfb` ≈ 生成（流式吐 token）时间；配合 `resp` 大小能算出 tok/s。
+  - 只想要数字说话的话：`detour.sh log | grep 'ttfb'`。
 
 ---
 
